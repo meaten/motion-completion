@@ -55,7 +55,9 @@ def quat2expmap(q):
     ValueError if the l2 norm of the quaternion is not close to 1
   """
   if (np.abs(np.linalg.norm(q)-1)>1e-3):
-    raise(ValueError, "quat2expmap: input quaternion is not norm 1")
+    print(np.linalg.norm(q), ' >1e-3 so, normalize')
+    q = q/np.linalg.norm(q)
+    #raise ValueError("quat2expmap: input quaternion is not norm 1")
 
   sinhalftheta = np.linalg.norm(q[1:])
   coshalftheta = q[0]
@@ -241,8 +243,9 @@ def load_data(path_to_dataset, subjects, actions, one_hot):
 
         print("Reading subject {0}, action {1}, subaction {2}".format(subj, action, subact))
 
-        filename = '{0}/S{1}/{2}_{3}.txt'.format( path_to_dataset, subj, action, subact)
-        action_sequence = readCSVasFloat(filename)
+        filename = '{0}/S{1}/{2}_{3}.npy'.format( path_to_dataset, subj, action, subact)
+        #action_sequence = readCSV...
+        action_sequence = np.load(filename)
 
         n, d = action_sequence.shape
         even_list = range(0, n, 2)
@@ -271,7 +274,7 @@ def normalize_data( data, data_mean, data_std, dim_to_use, actions, one_hot ):
   dividing by the standard deviation
 
   Args
-    data: nx99 matrix with data to normalize
+    data: nx96 matrix with data to normalize
     data_mean: vector of mean used to normalize the data
     data_std: vector of standard deviation used to normalize the data
     dim_to_use: vector with dimensions used by the model
@@ -292,7 +295,7 @@ def normalize_data( data, data_mean, data_std, dim_to_use, actions, one_hot ):
   else:
     # TODO hard-coding 99 dimensions for un-normalized human poses
     for key in data.keys():
-      data_out[ key ] = np.divide( (data[key][:, 0:99] - data_mean), data_std )
+      data_out[ key ] = np.divide( (data[key][:, 0:96] - data_mean), data_std )
       data_out[ key ] = data_out[ key ][ :, dim_to_use ]
       data_out[ key ] = np.hstack( (data_out[key], data[key][:,-nactions:]) )
 

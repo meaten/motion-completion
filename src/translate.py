@@ -1,4 +1,3 @@
-
 """Simple code for training an RNN for motion prediction."""
 
 from __future__ import absolute_import
@@ -35,7 +34,7 @@ tf.app.flags.DEFINE_integer("seq_length_out", 10, "Number of frames that the dec
 tf.app.flags.DEFINE_boolean("omit_one_hot", False, "Whether to remove one-hot encoding from the data")
 tf.app.flags.DEFINE_boolean("residual_velocities", False, "Add a residual connection that effectively models velocities")
 # Directories
-tf.app.flags.DEFINE_string("data_dir", os.path.normpath("./data/h3.6m/dataset"), "Data directory")
+tf.app.flags.DEFINE_string("data_dir", os.path.normpath("./data/h3.6m/dataset_rel3d"), "Data directory")
 tf.app.flags.DEFINE_string("train_dir", os.path.normpath("./experiments/"), "Training directory.")
 
 tf.app.flags.DEFINE_string("action","all", "The action to train on. all means all the actions, all_periodic means walking, eating and smoking")
@@ -47,7 +46,13 @@ tf.app.flags.DEFINE_boolean("sample", False, "Set to True for sampling.")
 tf.app.flags.DEFINE_boolean("use_cpu", False, "Whether to use the CPU")
 tf.app.flags.DEFINE_integer("load", 0, "Try to load a previous checkpoint.")
 
+tf.app.flags.DEFINE_string("gpu_assignment", "0", "Set gpu assignment")
+
 FLAGS = tf.app.flags.FLAGS
+
+os.environ["CUDA_VISIBLE_DEVICES"] = FLAGS.gpu_assignment
+
+
 
 train_dir = os.path.normpath(os.path.join( FLAGS.train_dir, FLAGS.action,
   'out_{0}'.format(FLAGS.seq_length_out),
@@ -121,7 +126,7 @@ def train():
     actions, FLAGS.seq_length_in, FLAGS.seq_length_out, FLAGS.data_dir, not FLAGS.omit_one_hot )
 
   # Limit TF to take a fraction of the GPU memory
-  gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=1)
+  gpu_options = tf.GPUOptions(allow_growth=True)
   device_count = {"GPU": 0} if FLAGS.use_cpu else {"GPU": 1}
 
   with tf.Session(config=tf.ConfigProto( gpu_options=gpu_options, device_count = device_count )) as sess:
@@ -135,8 +140,9 @@ def train():
 
     # === Read and denormalize the gt with srnn's seeds, as we'll need them
     # many times for evaluation in Euler Angles ===
-    srnn_gts_euler = get_srnn_gts( actions, model, test_set, data_mean,
-                              data_std, dim_to_ignore, not FLAGS.omit_one_hot )
+    srnn_gts = get_srnn_gts( actions, model, test_set, data_mean,
+                             data_std, dim_to_ignore, not FLAGS.omit_one_hot,
+                             to_euler=False)
 
     #=== This is the training loop ===
     step_time, loss, val_loss = 0.0, 0.0, 0.0
@@ -152,8 +158,9 @@ def train():
       # === Training step ===
       encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch( train_set, not FLAGS.omit_one_hot )
       _, step_loss, loss_summary, lr_summary = model.step( sess, encoder_inputs, decoder_inputs, decoder_outputs, False )
-      model.train_writer.add_summary( loss_summary, current_step )
-      model.train_writer.add_summary( lr_summary, current_step )
+      
+      model.train_writer.add_summary( summary=loss_summary, global_step=current_step )
+      model.train_writer.add_summary( summary=lr_summary, global_step=current_step )
 
       if current_step % 10 == 0:
         print("step {0:04d}; step_loss: {1:.4f}".format(current_step, step_loss ))
@@ -177,7 +184,7 @@ def train():
             encoder_inputs, decoder_inputs, decoder_outputs, forward_only)
         val_loss = step_loss # Loss book-keeping
 
-        model.test_writer.add_summary(loss_summary, current_step)
+        model.test_writer.add_summary(summary=loss_summary, global_step=current_step)
 
         print()
         print("{0: <16} |".format("milliseconds"), end="")
@@ -205,19 +212,19 @@ def train():
           # See https://github.com/asheshjain399/RNNexp/issues/6#issuecomment-247769197
           N_SEQUENCE_TEST = 8
           for i in np.arange(N_SEQUENCE_TEST):
-            eulerchannels_pred = srnn_pred_expmap[i]
-
+            channels_pred = srnn_pred_expmap[i]
+            '''
             # Convert from exponential map to Euler angles
             for j in np.arange( eulerchannels_pred.shape[0] ):
-              for k in np.arange(3,97,3):
+              for k in np.arange(0,eulerchannels_pred.shape[1],3):
                 eulerchannels_pred[j,k:k+3] = data_utils.rotmat2euler(
                   data_utils.expmap2rotmat( eulerchannels_pred[j,k:k+3] ))
-
+            '''
             # The global translation (first 3 entries) and global rotation
             # (next 3 entries) are also not considered in the error, so the_key
             # are set to zero.
             # See https://github.com/asheshjain399/RNNexp/issues/6#issuecomment-249404882
-            gt_i=np.copy(srnn_gts_euler[action][i])
+            gt_i=np.copy(srnn_gts[action][i])
             gt_i[:,0:6] = 0
 
             # Now compute the l2 error. The following is numpy port of the error
@@ -225,7 +232,7 @@ def train():
             # https://github.com/asheshjain399/RNNexp/blob/srnn/structural_rnn/CRFProblems/H3.6m/dataParser/Utils/motionGenerationError.m#L40-L54
             idx_to_use = np.where( np.std( gt_i, 0 ) > 1e-4 )[0]
             
-            euc_error = np.power( gt_i[:,idx_to_use] - eulerchannels_pred[:,idx_to_use], 2)
+            euc_error = np.power( gt_i[:,idx_to_use] - channels_pred[:,idx_to_use], 2)
             euc_error = np.sum(euc_error, 1)
             euc_error = np.sqrt( euc_error )
             mean_errors[i,:] = euc_error
@@ -455,7 +462,7 @@ def train():
                model.walkingtogether_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
 
           for i in np.arange(len( summaries )):
-            model.test_writer.add_summary(summaries[i], current_step)
+            model.test_writer.add_summary(summary=summaries[i], global_step=current_step)
 
 
         print()
@@ -484,6 +491,8 @@ def train():
         step_time, loss = 0, 0
 
         sys.stdout.flush()
+      model.train_writer.flush()
+      model.test_writer.flush()
 
 
 def get_srnn_gts( actions, model, test_set, data_mean, data_std, dim_to_ignore, one_hot, to_euler=True ):
@@ -518,7 +527,7 @@ def get_srnn_gts( actions, model, test_set, data_mean, data_std, dim_to_ignore, 
 
       if to_euler:
         for j in np.arange( denormed.shape[0] ):
-          for k in np.arange(3,97,3):
+          for k in np.arange(0,denormed.shape[1],3):
             denormed[j,k:k+3] = data_utils.rotmat2euler( data_utils.expmap2rotmat( denormed[j,k:k+3] ))
 
       srnn_gt_euler.append( denormed );
@@ -588,7 +597,7 @@ def sample():
           # Save prediction
           node_name = 'expmap/preds/{1}_{0}'.format(i, action)
           hf.create_dataset( node_name, data=srnn_pred_expmap[i] )
-
+      '''' 
       # Compute and save the errors here
       mean_errors = np.zeros( (len(srnn_pred_expmap), srnn_pred_expmap[0].shape[0]) )
 
@@ -597,7 +606,7 @@ def sample():
         eulerchannels_pred = srnn_pred_expmap[i]
 
         for j in np.arange( eulerchannels_pred.shape[0] ):
-          for k in np.arange(3,97,3):
+          for k in np.arange(0,eulerchannels_pred.shape[1],3):
             eulerchannels_pred[j,k:k+3] = data_utils.rotmat2euler(
               data_utils.expmap2rotmat( eulerchannels_pred[j,k:k+3] ))
 
@@ -618,7 +627,7 @@ def sample():
       with h5py.File( SAMPLES_FNAME, 'a' ) as hf:
         node_name = 'mean_{0}_error'.format( action )
         hf.create_dataset( node_name, data=mean_mean_errors )
-
+      '''
   return
 
 

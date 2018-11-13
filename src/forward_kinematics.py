@@ -11,6 +11,16 @@ import time
 import copy
 import data_utils
 
+def fkl_relative(xyz, parent):
+  assert len(xyz) == 96
+  xyz = np.reshape(xyz, (-1, 3))
+  for i in range(len(xyz)):
+    if parent[i] == -1:
+      pass
+    else:
+      xyz[i] += xyz[ parent[i] ]
+
+  return np.reshape(xyz, [-1])
 def fkl( angles, parent, offset, rotInd, expmapInd ):
   """
   Convert joint angles and bone lenghts into the 3d points of a person.
@@ -166,16 +176,16 @@ def main():
   nframes_gt, nframes_pred = expmap_gt.shape[0], expmap_pred.shape[0]
 
   # Put them together and revert the coordinate space
-  expmap_all = revert_coordinate_space( np.vstack((expmap_gt, expmap_pred)), np.eye(3), np.zeros(3) )
-  expmap_gt   = expmap_all[:nframes_gt,:]
-  expmap_pred = expmap_all[nframes_gt:,:]
+  #expmap_all = revert_coordinate_space( np.vstack((expmap_gt, expmap_pred)), np.eye(3), np.zeros(3) )
+  #expmap_gt   = expmap_all[:nframes_gt,:]
+  #expmap_pred = expmap_all[nframes_gt:,:]
 
   # Compute 3d points for each frame
   xyz_gt, xyz_pred = np.zeros((nframes_gt, 96)), np.zeros((nframes_pred, 96))
   for i in range( nframes_gt ):
-    xyz_gt[i,:] = fkl( expmap_gt[i,:], parent, offset, rotInd, expmapInd )
+    xyz_gt[i,:] = fkl_relative( expmap_gt[i,:], parent)
   for i in range( nframes_pred ):
-    xyz_pred[i,:] = fkl( expmap_pred[i,:], parent, offset, rotInd, expmapInd )
+    xyz_pred[i,:] = fkl_relative( expmap_pred[i,:], parent )
 
   # === Plot and animate ===
   fig = plt.figure()

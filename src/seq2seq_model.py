@@ -1,4 +1,3 @@
-
 """Sequence-to-sequence model for human motion prediction."""
 
 from __future__ import absolute_import
@@ -60,7 +59,7 @@ class Seq2SeqModel(object):
       dtype: the data type to use to store internal variables.
     """
 
-    self.HUMAN_SIZE = 54
+    self.HUMAN_SIZE = 87
     self.input_size = self.HUMAN_SIZE + number_of_actions if one_hot else self.HUMAN_SIZE
 
     print( "One hot is ", one_hot )
@@ -378,7 +377,7 @@ class Seq2SeqModel(object):
     self.saver = tf.train.Saver( tf.global_variables(), max_to_keep=10 )
 
   def step(self, session, encoder_inputs, decoder_inputs, decoder_outputs,
-             forward_only, srnn_seeds=False ):
+           forward_only, srnn_seeds=False ):
     """Run a step of the model feeding the given inputs.
 
     Args
@@ -434,7 +433,6 @@ class Seq2SeqModel(object):
 
   def get_batch( self, data, actions ):
     """Get a random batch of data from the specified bucket, prepare for step.
-
     Args
       data: a list of sequences of size n-by-d to fit the model to.
       actions: a list of the actions we are using
