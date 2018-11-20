@@ -125,7 +125,7 @@ def expmap2rotmat(r):
   return R
 
 
-def unNormalizeData(normalizedData, data_mean, data_std, dimensions_to_ignore, actions, one_hot ):
+def unNormalizeData(normalizedData, stats, actions, one_hot ):
   """Borrowed from SRNN code. Reads a csv file and returns a float32 matrix.
   https://github.com/asheshjain399/RNNexp/blob/srnn/structural_rnn/CRFProblems/H3.6m/generateMotionData.py#L12
 
@@ -139,27 +139,25 @@ def unNormalizeData(normalizedData, data_mean, data_std, dimensions_to_ignore, a
   Returns
     origData: data originally used to
   """
-  T = normalizedData.shape[0]
+  data_mean = stats[0]
+  data_std = stats[1]
+  dimensions_to_use = stats[3]
+  
   D = data_mean.shape[0]
-
-  origData = np.zeros((T, D), dtype=np.float32)
-  dimensions_to_use = []
-  for i in range(D):
-    if i in dimensions_to_ignore:
-      continue
-    dimensions_to_use.append(i)
-  dimensions_to_use = np.array(dimensions_to_use)
+  origData = np.zeros((normalizedData.shape[0],
+                       normalizedData.shape[1],
+                       D), dtype=np.float32)
 
   if one_hot:
-    origData[:, dimensions_to_use] = normalizedData[:, :-len(actions)]
+    origData[:, :, dimensions_to_use] = normalizedData[:, :-len(actions)]
   else:
-    origData[:, dimensions_to_use] = normalizedData
+    origData[:, :, dimensions_to_use] = normalizedData
 
   # potentially ineficient, but only done once per experiment
   stdMat = data_std.reshape((1, D))
-  stdMat = np.repeat(stdMat, T, axis=0)
+  #stdMat = np.repeat(stdMat, T, axis=0)
   meanMat = data_mean.reshape((1, D))
-  meanMat = np.repeat(meanMat, T, axis=0)
+  #meanMat = np.repeat(meanMat, T, axis=0)
   origData = np.multiply(origData, stdMat) + meanMat
   return origData
 
@@ -234,41 +232,78 @@ def load_data(path_to_dataset, subjects, actions, one_hot):
 
   trainData = {}
   completeData = []
-  for subj in subjects:
-    for action_idx in np.arange(len(actions)):
 
-      action = actions[ action_idx ]
+  for action_idx in np.arange(len(actions)):
 
-      for subact in [1, 2]:  # subactions
+    action = actions[ action_idx ]
 
-        print("Reading subject {0}, action {1}, subaction {2}".format(subj, action, subact))
+    filename = '{0}/{1}.npz'.format( path_to_dataset, action)
+    action_sequence = np.load(filename)['seq']
+    action_sequence_len = np.load(filename)['seq_len']
 
-        filename = '{0}/S{1}/{2}_{3}.npy'.format( path_to_dataset, subj, action, subact)
-        #action_sequence = readCSV...
-        action_sequence = np.load(filename)
+    #############################################################
+    n, d = action_sequence.shape
+    even_list = range(0, n, 2)
 
-        n, d = action_sequence.shape
-        even_list = range(0, n, 2)
-
-        if one_hot:
-          # Add a one-hot encoding at the end of the representation
-          the_sequence = np.zeros( (len(even_list), d + nactions), dtype=float )
-          the_sequence[ :, 0:d ] = action_sequence[even_list, :]
-          the_sequence[ :, d+action_idx ] = 1
-          trainData[(subj, action, subact, 'even')] = the_sequence
-        else:
-          trainData[(subj, action, subact, 'even')] = action_sequence[even_list, :]
+    if one_hot:
+      # Add a one-hot encoding at the end of the representation
+      the_sequence = np.zeros( (len(even_list), d + nactions), dtype=float )
+      the_sequence[ :, 0:d ] = action_sequence[even_list, :]
+      the_sequence[ :, d+action_idx ] = 1
+      trainData[(subj, action, subact, 'even')] = the_sequence
+    else:
+      trainData[(subj, action, subact, 'even')] = action_sequence[even_list, :]
 
 
-        if len(completeData) == 0:
-          completeData = copy.deepcopy(action_sequence)
-        else:
-          completeData = np.append(completeData, action_sequence, axis=0)
+    if len(completeData) == 0:
+      completeData = copy.deepcopy(action_sequence)
+    else:
+      completeData = np.append(completeData, action_sequence, axis=0)
 
   return trainData, completeData
 
+def rotmat(x,y):
+  norm_x = np.linalg.norm(x)
+  norm_y = np.linalg.norm(y)
+  if norm_x == 0 or norm_y == 0 or np.allclose(x, y):
+    return np.eye(3)
+  x = x / norm_x
+  y = y / norm_y
+                          
+  #return R matrix that rotate x to y
+  dot_xy = np.dot(x, y)
+  cos = dot_xy
+  rad = np.arccos(cos)
+  cross = np.cross(x,y)
+  if np.linalg.norm(cross) == 0:
+    return np.eye(3)
+  n = cross / np.linalg.norm(cross)
+  R = np.array([[np.cos(rad)+n[0]*n[0]*(1-np.cos(rad)),
+                 n[0]*n[1]*(1-np.cos(rad))-n[2]*np.sin(rad),
+                 n[0]*n[2]*(1-np.cos(rad))+n[1]*np.sin(rad)],
+                [n[1]*n[0]*(1-np.cos(rad))+n[2]*np.sin(rad),
+                 np.cos(rad)+n[1]*n[1]*(1-np.cos(rad)),
+                 n[1]*n[2]*(1-np.cos(rad))-n[0]*np.sin(rad)],
+                [n[2]*n[0]*(1-np.cos(rad))-n[1]*np.sin(rad),
+                 n[2]*n[1]*(1-np.cos(rad))+n[0]*np.sin(rad),
+                 np.cos(rad)+n[2]*n[2]*(1-np.cos(rad))]])
+  return R
 
-def normalize_data( data, data_mean, data_std, dim_to_use, actions, one_hot ):
+
+def rotate_data(all_seq):
+  all_seq_out = np.zeros_like(all_seq)
+  for i, seq in enumerate(all_seq):
+    origin = seq[0,0,0]
+    seq[:,:,0] -= origin
+    R = rotmat(seq[1,0,0] - seq[0,0,0], [1,0,0])
+    seq = np.matmul(seq, R)
+    R = rotmat([0,0,1], seq[0,0,1])
+    seq = np.matmul(seq, R)
+    all_seq_out[i] = seq
+  
+  return all_seq_out
+
+def normalize_data( data, stats, actions, one_hot ):
   """
   Normalize input data by removing unused dimensions, subtracting the mean and
   dividing by the standard deviation
@@ -283,21 +318,18 @@ def normalize_data( data, data_mean, data_std, dim_to_use, actions, one_hot ):
   Returns
     data_out: the passed data matrix, but normalized
   """
-  data_out = {}
-  nactions = len(actions)
-
+  data_out = np.zeros_like(data)
+  data_mean = stats[0]
+  data_std = stats[1]
+  dim_to_use = stats[3]
+  
   if not one_hot:
     # No one-hot encoding... no need to do anything special
-    for key in data.keys():
-      data_out[ key ] = np.divide( (data[key] - data_mean), data_std )
-      data_out[ key ] = data_out[ key ][ :, dim_to_use ]
+    data_out = np.divide( (data - data_mean), data_std )
+    data_out = data_out[ :, :,dim_to_use ]
 
   else:
-    # TODO hard-coding 99 dimensions for un-normalized human poses
-    for key in data.keys():
-      data_out[ key ] = np.divide( (data[key][:, 0:96] - data_mean), data_std )
-      data_out[ key ] = data_out[ key ][ :, dim_to_use ]
-      data_out[ key ] = np.hstack( (data_out[key], data[key][:,-nactions:]) )
+    print('this has not been implemented')
 
   return data_out
 
@@ -325,5 +357,4 @@ def normalization_stats(completeData):
   dimensions_to_use.extend( list(np.where(data_std >= 1e-4)[0]) )
 
   data_std[dimensions_to_ignore] = 1.0
-
   return data_mean, data_std, dimensions_to_ignore, dimensions_to_use

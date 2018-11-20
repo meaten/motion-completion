@@ -1,3 +1,4 @@
+
 """Simple code for training an RNN for motion prediction."""
 
 from __future__ import absolute_import
@@ -29,24 +30,25 @@ tf.app.flags.DEFINE_integer("iterations", int(1e5), "Iterations to train for.")
 tf.app.flags.DEFINE_string("architecture", "tied", "Seq2seq architecture to use: [basic, tied].")
 tf.app.flags.DEFINE_integer("size", 1024, "Size of each model layer.")
 tf.app.flags.DEFINE_integer("num_layers", 1, "Number of layers in the model.")
-tf.app.flags.DEFINE_integer("seq_length_in", 50, "Number of frames to feed into the encoder. 25 fps")
-tf.app.flags.DEFINE_integer("seq_length_out", 10, "Number of frames that the decoder has to predict. 25fps")
-tf.app.flags.DEFINE_boolean("omit_one_hot", False, "Whether to remove one-hot encoding from the data")
+tf.app.flags.DEFINE_integer("seq_length_in", 10, "Number of frames to feed into the encoder. 30 fps")
+#tf.app.flags.DEFINE_integer("seq_length_out", 10, "Number of frames that the decoder has to predict. 30 fps")
+tf.app.flags.DEFINE_integer("seq_max_length", 200, "")
+tf.app.flags.DEFINE_boolean("omit_one_hot", True, "Whether to remove one-hot encoding from the data")
 tf.app.flags.DEFINE_boolean("residual_velocities", False, "Add a residual connection that effectively models velocities")
 # Directories
-tf.app.flags.DEFINE_string("data_dir", os.path.normpath("./data/h3.6m/dataset_rel3d"), "Data directory")
+tf.app.flags.DEFINE_string("data_dir", os.path.normpath("./data/"), "Data directory")
 tf.app.flags.DEFINE_string("train_dir", os.path.normpath("./experiments/"), "Training directory.")
 
-tf.app.flags.DEFINE_string("action","all", "The action to train on. all means all the actions, all_periodic means walking, eating and smoking")
+tf.app.flags.DEFINE_string("action","fistbump", "The action to train on.")
 tf.app.flags.DEFINE_string("loss_to_use","supervised", "The type of loss to use, supervised or sampling_based")
 
-tf.app.flags.DEFINE_integer("test_every", 1000, "How often to compute error on the test set.")
-tf.app.flags.DEFINE_integer("save_every", 1000, "How often to compute error on the test set.")
+tf.app.flags.DEFINE_integer("test_every", 100, "How often to compute error on the test set.")
+tf.app.flags.DEFINE_integer("save_every", 100, "How often to compute error on the test set.")
 tf.app.flags.DEFINE_boolean("sample", False, "Set to True for sampling.")
 tf.app.flags.DEFINE_boolean("use_cpu", False, "Whether to use the CPU")
 tf.app.flags.DEFINE_integer("load", 0, "Try to load a previous checkpoint.")
 
-tf.app.flags.DEFINE_string("gpu_assignment", "0", "Set gpu assignment")
+tf.app.flags.DEFINE_string("gpu_assignment", "1", "Set gpu assignment")
 
 FLAGS = tf.app.flags.FLAGS
 
@@ -55,7 +57,6 @@ os.environ["CUDA_VISIBLE_DEVICES"] = FLAGS.gpu_assignment
 
 
 train_dir = os.path.normpath(os.path.join( FLAGS.train_dir, FLAGS.action,
-  'out_{0}'.format(FLAGS.seq_length_out),
   'iterations_{0}'.format(FLAGS.iterations),
   FLAGS.architecture,
   FLAGS.loss_to_use,
@@ -67,25 +68,26 @@ train_dir = os.path.normpath(os.path.join( FLAGS.train_dir, FLAGS.action,
 
 summaries_dir = os.path.normpath(os.path.join( train_dir, "log" )) # Directory for TB summaries
 
-def create_model(session, actions, sampling=False):
+def create_model(session, actions):
   """Create translation model and initialize or load parameters in session."""
-
+  
   model = seq2seq_model.Seq2SeqModel(
-      FLAGS.architecture,
-      FLAGS.seq_length_in if not sampling else 50,
-      FLAGS.seq_length_out if not sampling else 100,
-      FLAGS.size, # hidden layer size
-      FLAGS.num_layers,
-      FLAGS.max_gradient_norm,
-      FLAGS.batch_size,
-      FLAGS.learning_rate,
-      FLAGS.learning_rate_decay_factor,
-      summaries_dir,
-      FLAGS.loss_to_use if not sampling else "sampling_based",
-      len( actions ),
-      not FLAGS.omit_one_hot,
-      FLAGS.residual_velocities,
-      dtype=tf.float32)
+    FLAGS.architecture,
+    FLAGS.seq_length_in,
+    #FLAGS.seq_length_out if not sampling else 100,
+    FLAGS.seq_max_length,
+    FLAGS.size, # hidden layer size
+    FLAGS.num_layers,
+    FLAGS.max_gradient_norm,
+    FLAGS.batch_size,
+    FLAGS.learning_rate,
+    FLAGS.learning_rate_decay_factor,
+    summaries_dir,
+    FLAGS.loss_to_use ,
+    len( actions ),
+    not FLAGS.omit_one_hot,
+    FLAGS.residual_velocities,
+    dtype=tf.float32)
 
   if FLAGS.load <= 0:
     print("Creating model with fresh parameters.")
@@ -122,8 +124,8 @@ def train():
 
   number_of_actions = len( actions )
 
-  train_set, test_set, data_mean, data_std, dim_to_ignore, dim_to_use = read_all_data(
-    actions, FLAGS.seq_length_in, FLAGS.seq_length_out, FLAGS.data_dir, not FLAGS.omit_one_hot )
+  train_set, test_set, rp_stats, ch_stats = read_all_data(
+    actions, FLAGS.seq_length_in, FLAGS.data_dir, not FLAGS.omit_one_hot )
 
   # Limit TF to take a fraction of the GPU memory
   gpu_options = tf.GPUOptions(allow_growth=True)
@@ -138,12 +140,6 @@ def train():
     model.train_writer.add_graph( sess.graph )
     print( "Model created" )
 
-    # === Read and denormalize the gt with srnn's seeds, as we'll need them
-    # many times for evaluation in Euler Angles ===
-    srnn_gts = get_srnn_gts( actions, model, test_set, data_mean,
-                             data_std, dim_to_ignore, not FLAGS.omit_one_hot,
-                             to_euler=False)
-
     #=== This is the training loop ===
     step_time, loss, val_loss = 0.0, 0.0, 0.0
     current_step = 0 if FLAGS.load <= 0 else FLAGS.load + 1
@@ -154,14 +150,19 @@ def train():
     for _ in xrange( FLAGS.iterations ):
 
       start_time = time.time()
-
+      batch_shuffle = [ i for i in range(len(train_set))][:FLAGS.batch_size]
+      
       # === Training step ===
-      encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch( train_set, not FLAGS.omit_one_hot )
+      #encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch( train_set, not FLAGS.omit_one_hot )
+      encoder_inputs = train_set[batch_shuffle, 0, :FLAGS.seq_length_in]
+      decoder_inputs = train_set[batch_shuffle, 0, FLAGS.seq_length_in:]
+      decoder_outputs= train_set[batch_shuffle, 1, FLAGS.seq_length_in:]
+
       _, step_loss, loss_summary, lr_summary = model.step( sess, encoder_inputs, decoder_inputs, decoder_outputs, False )
       
-      model.train_writer.add_summary( summary=loss_summary, global_step=current_step )
-      model.train_writer.add_summary( summary=lr_summary, global_step=current_step )
-
+      model.train_writer.add_summary(summary=loss_summary,global_step=current_step)
+      #model.train_writer.add_summary( summary=lr_summary, global_step=current_step )
+      
       if current_step % 10 == 0:
         print("step {0:04d}; step_loss: {1:.4f}".format(current_step, step_loss ))
 
@@ -179,292 +180,17 @@ def train():
         # === Validation with randomly chosen seeds ===
         forward_only = True
 
-        encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch( test_set, not FLAGS.omit_one_hot )
+        encoder_inputs = test_set[:, 0, :FLAGS.seq_length_in]
+        decoder_inputs = test_set[:, 0, FLAGS.seq_length_in:]
+        decoder_outputs= test_set[:, 1, FLAGS.seq_length_in:]
+        
         step_loss, loss_summary = model.step(sess,
             encoder_inputs, decoder_inputs, decoder_outputs, forward_only)
         val_loss = step_loss # Loss book-keeping
 
-        model.test_writer.add_summary(summary=loss_summary, global_step=current_step)
+        model.test_writer.add_summary(summary=loss_summary,global_step=current_step)
 
-        print()
-        print("{0: <16} |".format("milliseconds"), end="")
-        for ms in [80, 160, 320, 400, 560, 1000]:
-          print(" {0:5d} |".format(ms), end="")
-        print()
-
-        # === Validation with srnn's seeds ===
-        for action in actions:
-
-          # Evaluate the model on the test batches
-          encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch_srnn( test_set, action )
-          srnn_loss, srnn_poses, _ = model.step(sess, encoder_inputs, decoder_inputs,
-                                                   decoder_outputs, True, True)
-
-          # Denormalize the output
-          srnn_pred_expmap = data_utils.revert_output_format( srnn_poses,
-            data_mean, data_std, dim_to_ignore, actions, not FLAGS.omit_one_hot )
-
-          # Save the errors here
-          mean_errors = np.zeros( (len(srnn_pred_expmap), srnn_pred_expmap[0].shape[0]) )
-
-          # Training is done in exponential map, but the error is reported in
-          # Euler angles, as in previous work.
-          # See https://github.com/asheshjain399/RNNexp/issues/6#issuecomment-247769197
-          N_SEQUENCE_TEST = 8
-          for i in np.arange(N_SEQUENCE_TEST):
-            channels_pred = srnn_pred_expmap[i]
-            '''
-            # Convert from exponential map to Euler angles
-            for j in np.arange( eulerchannels_pred.shape[0] ):
-              for k in np.arange(0,eulerchannels_pred.shape[1],3):
-                eulerchannels_pred[j,k:k+3] = data_utils.rotmat2euler(
-                  data_utils.expmap2rotmat( eulerchannels_pred[j,k:k+3] ))
-            '''
-            # The global translation (first 3 entries) and global rotation
-            # (next 3 entries) are also not considered in the error, so the_key
-            # are set to zero.
-            # See https://github.com/asheshjain399/RNNexp/issues/6#issuecomment-249404882
-            gt_i=np.copy(srnn_gts[action][i])
-            gt_i[:,0:6] = 0
-
-            # Now compute the l2 error. The following is numpy port of the error
-            # function provided by Ashesh Jain (in matlab), available at
-            # https://github.com/asheshjain399/RNNexp/blob/srnn/structural_rnn/CRFProblems/H3.6m/dataParser/Utils/motionGenerationError.m#L40-L54
-            idx_to_use = np.where( np.std( gt_i, 0 ) > 1e-4 )[0]
-            
-            euc_error = np.power( gt_i[:,idx_to_use] - channels_pred[:,idx_to_use], 2)
-            euc_error = np.sum(euc_error, 1)
-            euc_error = np.sqrt( euc_error )
-            mean_errors[i,:] = euc_error
-
-          # This is simply the mean error over the N_SEQUENCE_TEST examples
-          mean_mean_errors = np.mean( mean_errors, 0 )
-
-          # Pretty print of the results for 80, 160, 320, 400, 560 and 1000 ms
-          print("{0: <16} |".format(action), end="")
-          for ms in [1,3,7,9,13,24]:
-            if FLAGS.seq_length_out >= ms+1:
-              print(" {0:.3f} |".format( mean_mean_errors[ms] ), end="")
-            else:
-              print("   n/a |", end="")
-          print()
-
-          # Ugly massive if-then to log the error to tensorboard :shrug:
-          if action == "walking":
-            summaries = sess.run(
-              [model.walking_err80_summary,
-               model.walking_err160_summary,
-               model.walking_err320_summary,
-               model.walking_err400_summary,
-               model.walking_err560_summary,
-               model.walking_err1000_summary],
-              {model.walking_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.walking_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.walking_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.walking_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.walking_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.walking_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "eating":
-            summaries = sess.run(
-              [model.eating_err80_summary,
-               model.eating_err160_summary,
-               model.eating_err320_summary,
-               model.eating_err400_summary,
-               model.eating_err560_summary,
-               model.eating_err1000_summary],
-              {model.eating_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.eating_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.eating_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.eating_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.eating_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.eating_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "smoking":
-            summaries = sess.run(
-              [model.smoking_err80_summary,
-               model.smoking_err160_summary,
-               model.smoking_err320_summary,
-               model.smoking_err400_summary,
-               model.smoking_err560_summary,
-               model.smoking_err1000_summary],
-              {model.smoking_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.smoking_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.smoking_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.smoking_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.smoking_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.smoking_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "discussion":
-            summaries = sess.run(
-              [model.discussion_err80_summary,
-               model.discussion_err160_summary,
-               model.discussion_err320_summary,
-               model.discussion_err400_summary,
-               model.discussion_err560_summary,
-               model.discussion_err1000_summary],
-              {model.discussion_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.discussion_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.discussion_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.discussion_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.discussion_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.discussion_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "directions":
-            summaries = sess.run(
-              [model.directions_err80_summary,
-               model.directions_err160_summary,
-               model.directions_err320_summary,
-               model.directions_err400_summary,
-               model.directions_err560_summary,
-               model.directions_err1000_summary],
-              {model.directions_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.directions_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.directions_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.directions_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.directions_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.directions_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "greeting":
-            summaries = sess.run(
-              [model.greeting_err80_summary,
-               model.greeting_err160_summary,
-               model.greeting_err320_summary,
-               model.greeting_err400_summary,
-               model.greeting_err560_summary,
-               model.greeting_err1000_summary],
-              {model.greeting_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.greeting_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.greeting_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.greeting_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.greeting_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.greeting_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "phoning":
-            summaries = sess.run(
-              [model.phoning_err80_summary,
-               model.phoning_err160_summary,
-               model.phoning_err320_summary,
-               model.phoning_err400_summary,
-               model.phoning_err560_summary,
-               model.phoning_err1000_summary],
-              {model.phoning_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.phoning_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.phoning_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.phoning_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.phoning_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.phoning_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "posing":
-            summaries = sess.run(
-              [model.posing_err80_summary,
-               model.posing_err160_summary,
-               model.posing_err320_summary,
-               model.posing_err400_summary,
-               model.posing_err560_summary,
-               model.posing_err1000_summary],
-              {model.posing_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.posing_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.posing_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.posing_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.posing_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.posing_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "purchases":
-            summaries = sess.run(
-              [model.purchases_err80_summary,
-               model.purchases_err160_summary,
-               model.purchases_err320_summary,
-               model.purchases_err400_summary,
-               model.purchases_err560_summary,
-               model.purchases_err1000_summary],
-              {model.purchases_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.purchases_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.purchases_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.purchases_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.purchases_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.purchases_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "sitting":
-            summaries = sess.run(
-              [model.sitting_err80_summary,
-               model.sitting_err160_summary,
-               model.sitting_err320_summary,
-               model.sitting_err400_summary,
-               model.sitting_err560_summary,
-               model.sitting_err1000_summary],
-              {model.sitting_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.sitting_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.sitting_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.sitting_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.sitting_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.sitting_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "sittingdown":
-            summaries = sess.run(
-              [model.sittingdown_err80_summary,
-               model.sittingdown_err160_summary,
-               model.sittingdown_err320_summary,
-               model.sittingdown_err400_summary,
-               model.sittingdown_err560_summary,
-               model.sittingdown_err1000_summary],
-              {model.sittingdown_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.sittingdown_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.sittingdown_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.sittingdown_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.sittingdown_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.sittingdown_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "takingphoto":
-            summaries = sess.run(
-              [model.takingphoto_err80_summary,
-               model.takingphoto_err160_summary,
-               model.takingphoto_err320_summary,
-               model.takingphoto_err400_summary,
-               model.takingphoto_err560_summary,
-               model.takingphoto_err1000_summary],
-              {model.takingphoto_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.takingphoto_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.takingphoto_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.takingphoto_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.takingphoto_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.takingphoto_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "waiting":
-            summaries = sess.run(
-              [model.waiting_err80_summary,
-               model.waiting_err160_summary,
-               model.waiting_err320_summary,
-               model.waiting_err400_summary,
-               model.waiting_err560_summary,
-               model.waiting_err1000_summary],
-              {model.waiting_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.waiting_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.waiting_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.waiting_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.waiting_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.waiting_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "walkingdog":
-            summaries = sess.run(
-              [model.walkingdog_err80_summary,
-               model.walkingdog_err160_summary,
-               model.walkingdog_err320_summary,
-               model.walkingdog_err400_summary,
-               model.walkingdog_err560_summary,
-               model.walkingdog_err1000_summary],
-              {model.walkingdog_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.walkingdog_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.walkingdog_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.walkingdog_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.walkingdog_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.walkingdog_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-          elif action == "walkingtogether":
-            summaries = sess.run(
-              [model.walkingtogether_err80_summary,
-               model.walkingtogether_err160_summary,
-               model.walkingtogether_err320_summary,
-               model.walkingtogether_err400_summary,
-               model.walkingtogether_err560_summary,
-               model.walkingtogether_err1000_summary],
-              {model.walkingtogether_err80: mean_mean_errors[1] if FLAGS.seq_length_out >= 2 else None,
-               model.walkingtogether_err160: mean_mean_errors[3] if FLAGS.seq_length_out >= 4 else None,
-               model.walkingtogether_err320: mean_mean_errors[7] if FLAGS.seq_length_out >= 8 else None,
-               model.walkingtogether_err400: mean_mean_errors[9] if FLAGS.seq_length_out >= 10 else None,
-               model.walkingtogether_err560: mean_mean_errors[13] if FLAGS.seq_length_out >= 14 else None,
-               model.walkingtogether_err1000: mean_mean_errors[24] if FLAGS.seq_length_out >= 25 else None})
-
-          for i in np.arange(len( summaries )):
-            model.test_writer.add_summary(summary=summaries[i], global_step=current_step)
-
-
+        
         print()
         print("============================\n"
               "Global step:         %d\n"
@@ -473,10 +199,8 @@ def train():
               "Train loss avg:      %.4f\n"
               "--------------------------\n"
               "Val loss:            %.4f\n"
-              "srnn loss:           %.4f\n"
               "============================" % (model.global_step.eval(),
-              model.learning_rate.eval(), step_time*1000, loss,
-              val_loss, srnn_loss))
+              model.learning_rate.eval(), step_time*1000, loss,val_loss))
         print()
 
         previous_losses.append(loss)
@@ -495,49 +219,6 @@ def train():
       model.test_writer.flush()
 
 
-def get_srnn_gts( actions, model, test_set, data_mean, data_std, dim_to_ignore, one_hot, to_euler=True ):
-  """
-  Get the ground truths for srnn's sequences, and convert to Euler angles.
-  (the error is always computed in Euler angles).
-
-  Args
-    actions: a list of actions to get ground truths for.
-    model: training model we are using (we only use the "get_batch" method).
-    test_set: dictionary with normalized training data.
-    data_mean: d-long vector with the mean of the training data.
-    data_std: d-long vector with the standard deviation of the training data.
-    dim_to_ignore: dimensions that we are not using to train/predict.
-    one_hot: whether the data comes with one-hot encoding indicating action.
-    to_euler: whether to convert the angles to Euler format or keep thm in exponential map
-
-  Returns
-    srnn_gts_euler: a dictionary where the keys are actions, and the values
-      are the ground_truth, denormalized expected outputs of srnns's seeds.
-  """
-  srnn_gts_euler = {}
-
-  for action in actions:
-
-    srnn_gt_euler = []
-    _, _, srnn_expmap = model.get_batch_srnn( test_set, action )
-
-    # expmap -> rotmat -> euler
-    for i in np.arange( srnn_expmap.shape[0] ):
-      denormed = data_utils.unNormalizeData(srnn_expmap[i,:,:], data_mean, data_std, dim_to_ignore, actions, one_hot )
-
-      if to_euler:
-        for j in np.arange( denormed.shape[0] ):
-          for k in np.arange(0,denormed.shape[1],3):
-            denormed[j,k:k+3] = data_utils.rotmat2euler( data_utils.expmap2rotmat( denormed[j,k:k+3] ))
-
-      srnn_gt_euler.append( denormed );
-
-    # Put back in the dictionary
-    srnn_gts_euler[action] = srnn_gt_euler
-
-  return srnn_gts_euler
-
-
 def sample():
   """Sample predictions for srnn's seeds"""
 
@@ -552,51 +233,52 @@ def sample():
 
     # === Create the model ===
     print("Creating %d layers of %d units." % (FLAGS.num_layers, FLAGS.size))
-    sampling     = False
-    model = create_model(sess, actions, sampling)
+    model = create_model(sess, actions)
     print("Model created")
 
     # Load all the data
-    train_set, test_set, data_mean, data_std, dim_to_ignore, dim_to_use = read_all_data(
-      actions, FLAGS.seq_length_in, FLAGS.seq_length_out, FLAGS.data_dir, not FLAGS.omit_one_hot )
-
-    # === Read and denormalize the gt with srnn's seeds, as we'll need them
-    # many times for evaluation in Euler Angles ===
-    srnn_gts_expmap = get_srnn_gts( actions, model, test_set, data_mean,
-                              data_std, dim_to_ignore, not FLAGS.omit_one_hot, to_euler=False )
-    srnn_gts_euler = get_srnn_gts( actions, model, test_set, data_mean,
-                              data_std, dim_to_ignore, not FLAGS.omit_one_hot )
-
+    train_set, test_set, rp_stats, ch_stats = read_all_data(
+      actions, FLAGS.seq_length_in, FLAGS.data_dir, not FLAGS.omit_one_hot )
+    
     # Clean and create a new h5 file of samples
-    SAMPLES_FNAME = 'samples.h5'
+    SAMPLES_DNAME = 'samples'
     try:
-      os.remove( SAMPLES_FNAME )
+      import shutil; shutil.rmtree( SAMPLES_DNAME )
     except OSError:
       pass
 
     # Predict and save for each action
     for action in actions:
 
-      # Make prediction with srnn' seeds
-      encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch_srnn( test_set, action )
-      forward_only = True
-      srnn_seeds = True
-      srnn_loss, srnn_poses, _ = model.step(sess, encoder_inputs, decoder_inputs, decoder_outputs, forward_only, srnn_seeds)
 
+      encoder_inputs = test_set[:, 0, :FLAGS.seq_length_in]
+      decoder_inputs = test_set[:, 0, FLAGS.seq_length_in:]
+      decoder_outputs= test_set[:, 1, FLAGS.seq_length_in:]
+      
+      forward_only = True
+      pred_loss, pred_poses, _ = model.step(sess, encoder_inputs, decoder_inputs, decoder_outputs, forward_only, False)
+
+      pred_poses = np.array(pred_poses)
+
+      
       # denormalizes too
-      srnn_pred_expmap = data_utils.revert_output_format( srnn_poses, data_mean, data_std, dim_to_ignore, actions, not FLAGS.omit_one_hot )
+      test_set[:,0] = data_utils.unNormalizeData(test_set[:,0], rp_stats, actions, False)
+      test_set[:,1] = data_utils.unNormalizeData(test_set[:,1], ch_stats, actions, False)
+      pred_poses = data_utils.unNormalizeData(np.reshape(pred_poses, [pred_poses.shape[1],
+                                                                      pred_poses.shape[0],
+                                                                      -1]),
+                                                         ch_stats, actions, False)
 
       # Save the conditioning seeds
 
       # Save the samples
-      with h5py.File( SAMPLES_FNAME, 'a' ) as hf:
-        for i in np.arange(8):
-          # Save conditioning ground truth
-          node_name = 'expmap/gt/{1}_{0}'.format(i, action)
-          hf.create_dataset( node_name, data=srnn_gts_expmap[action][i] )
-          # Save prediction
-          node_name = 'expmap/preds/{1}_{0}'.format(i, action)
-          hf.create_dataset( node_name, data=srnn_pred_expmap[i] )
+      os.mkdir(SAMPLES_DNAME)
+      for i in range(len(pred_poses)):
+        np.savez(SAMPLES_DNAME+'/sample{}.npz'.format(i),
+                 real_person=test_set[i,0],
+                 character=pred_poses[i],
+                 ground_truth=test_set[i,1],
+                 loss=pred_loss)
       '''' 
       # Compute and save the errors here
       mean_errors = np.zeros( (len(srnn_pred_expmap), srnn_pred_expmap[0].shape[0]) )
@@ -643,10 +325,7 @@ def define_actions( action ):
     ValueError if the action is not included in H3.6M
   """
 
-  actions = ["walking", "eating", "smoking", "discussion",  "directions",
-              "greeting", "phoning", "posing", "purchases", "sitting",
-              "sittingdown", "takingphoto", "waiting", "walkingdog",
-              "walkingtogether"]
+  actions = ["fistbump"]
 
   if action in actions:
     return [action]
@@ -660,44 +339,69 @@ def define_actions( action ):
   raise( ValueError, "Unrecognized action: %d" % action )
 
 
-def read_all_data( actions, seq_length_in, seq_length_out, data_dir, one_hot ):
+def read_all_data( actions, seq_length_in, data_dir, one_hot ):
   """
   Loads data for training/testing and normalizes it.
 
   Args
-    actions: list of strings (actions) to load
-    seq_length_in: number of frames to use in the burn-in sequence
-    seq_length_out: number of frames to use in the output sequence
-    data_dir: directory to load the data from
-    one_hot: whether to use one-hot encoding per action
+
   Returns
-    train_set: dictionary with normalized training data
-    test_set: dictionary with test data
-    data_mean: d-long vector with the mean of the training data
-    data_std: d-long vector with the standard dev of the training data
-    dim_to_ignore: dimensions that are not used becaused stdev is too small
-    dim_to_use: dimensions that we are actually using in the model
+
   """
 
   # === Read training data ===
-  print ("Reading training data (seq_len_in: {0}, seq_len_out {1}).".format(
-           seq_length_in, seq_length_out))
+  print ("Reading training data (seq_len_in: {0}).".format(
+           seq_length_in))
 
-  train_subject_ids = [1,6,7,8,9,11]
-  test_subject_ids = [5]
+  #####
+  #need to add one-hot vector to each frame later
+  #####
+  for i, action in enumerate(actions):
+    action_seq = np.load(data_dir+'/'+action+'.npz')['seq']
+    action_seq_len = np.load(data_dir+'/'+action+'.npz')['seq_len']
+    all_seq = np.concatenate((all_seq, action_seq), axis=0) if i > 0 else action_seq
+    all_seq_len = np.concatenate((all_seq_len, action_seq_len), axis=0) \
+                  if i > 0 else action_seq_len
 
-  train_set, complete_train = data_utils.load_data( data_dir, train_subject_ids, actions, one_hot )
-  test_set,  complete_test  = data_utils.load_data( data_dir, test_subject_ids,  actions, one_hot )
+  """
+  all_seq: [data_index, skeleton_num, frame_len, joints, xyz]
+  """
+  all_seq = np.concatenate((data_utils.rotate_data(all_seq),
+                            data_utils.rotate_data(all_seq[:,[1,0]])), axis=0)
 
+  #all_seq = np.concatenate((all_seq,all_seq[:,[1,0]]), axis=0)
+  
+  all_seq_len = np.asarray(np.concatenate((all_seq_len, all_seq_len), axis=0), dtype=int)
+  shape = all_seq.shape
+  all_seq = np.reshape(all_seq, [shape[0], shape[1], shape[2], -1])
+  
+  from sklearn.model_selection import train_test_split
+  train_seq, test_seq, train_seq_len, test_seq_len = train_test_split(all_seq,
+                                                                      all_seq_len,
+                                                                      test_size=0.25,
+                                                                      random_state=0)
+  
+  for i, (seq, seq_len) in enumerate(zip(train_seq, train_seq_len)):
+    try:
+      complete_seq = np.concatenate((complete_seq, seq[: ,:seq_len]), axis=1) if i > 0 \
+                     else seq[:, :seq_len]
+    except ValueError:
+      import pdb; pdb.set_trace()
+  complete_real_person, complete_character = complete_seq
+  
   # Compute normalization stats
-  data_mean, data_std, dim_to_ignore, dim_to_use = data_utils.normalization_stats(complete_train)
+  rp_stats = data_utils.normalization_stats(complete_real_person)
+  ch_stats = data_utils.normalization_stats(complete_character)
 
   # Normalize -- subtract mean, divide by stdev
-  train_set = data_utils.normalize_data( train_set, data_mean, data_std, dim_to_use, actions, one_hot )
-  test_set  = data_utils.normalize_data( test_set,  data_mean, data_std, dim_to_use, actions, one_hot )
+  train_seq[:,0] = data_utils.normalize_data( train_seq[:,0], rp_stats, actions,one_hot )
+  train_seq[:,1] = data_utils.normalize_data( train_seq[:,1], ch_stats, actions,one_hot )
+  test_seq[:, 0] = data_utils.normalize_data( test_seq[:, 0], rp_stats, actions,one_hot )
+  test_seq[:, 1] = data_utils.normalize_data( test_seq[:, 1], ch_stats, actions,one_hot )
+  
   print("done reading data.")
 
-  return train_set, test_set, data_mean, data_std, dim_to_ignore, dim_to_use
+  return train_seq, test_seq, rp_stats, ch_stats
 
 
 def main(_):
