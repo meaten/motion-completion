@@ -91,11 +91,13 @@ class Seq2SeqModel(object):
       enc_in = tf.placeholder(dtype, shape=[None, self.source_seq_len, self.input_size], name="enc_in")
       dec_in = tf.placeholder(dtype, shape=[None, self.target_seq_len, self.input_size], name="dec_in")
       dec_out = tf.placeholder(dtype, shape=[None, self.target_seq_len, self.input_size], name="dec_out")
+      seq_length = tf.placeholder(tf.int32, shape=[None], name="seq_length")
 
       self.encoder_inputs = enc_in
       self.decoder_inputs = dec_in
       self.decoder_outputs = dec_out
-
+      self.seq_length = seq_length
+      
       enc_in = tf.transpose(enc_in, [1, 0, 2])
       dec_in = tf.transpose(dec_in, [1, 0, 2])
       dec_out = tf.transpose(dec_out, [1, 0, 2])
@@ -140,13 +142,27 @@ class Seq2SeqModel(object):
       raise(ValueError, "Uknown architecture: %s" % architecture )
 
     self.outputs = outputs
-
+    mask1 = tf.tile(tf.expand_dims(tf.transpose(tf.sequence_mask(
+      self.seq_length-self.source_seq_len,
+      dtype=tf.float32,
+      maxlen=self.target_seq_len)),-1), [1,1,63])
+    mask2 = tf.tile(tf.expand_dims(tf.transpose(tf.sequence_mask(
+      self.seq_length-self.source_seq_len-1,
+      dtype=tf.float32,
+      maxlen=self.target_seq_len-1)),-1), [1,1,63])
     with tf.name_scope("loss_angles"):
-      loss_angles = tf.reduce_mean(tf.square(tf.subtract(dec_out, outputs)))
-    loss_smooth = tf.reduce_mean(tf.square(tf.subtract(outputs[1:], outputs[:-1])))
-    self.loss         = tf.divide(tf.add(loss_angles, loss_smooth), self.batch_size)
+      loss_angles = tf.reduce_mean(tf.square(tf.subtract(tf.multiply(outputs,mask1),
+                                                         tf.multiply(dec_out,mask1))))
+    loss_smooth = tf.reduce_mean(tf.square(
+      tf.multiply(tf.subtract(outputs[1:],outputs[:-1]),mask2)))
+    self.loss         = tf.add(loss_angles, loss_smooth)
     self.loss_summary = tf.summary.scalar('loss/loss', self.loss)
 
+    self.loss_each_data = tf.reduce_mean(tf.square(tf.subtract(tf.multiply(dec_out,mask1),
+                                                               tf.multiply(outputs,mask1))),
+                                         axis=[0,2]) \
+                        + tf.reduce_mean(tf.square(tf.multiply(tf.subtract(
+                          outputs[1:], outputs[:-1]),mask2)),axis=[0,2])
     # Gradients and SGD update operation for training the model.
     params = tf.trainable_variables()
 
@@ -164,8 +180,8 @@ class Seq2SeqModel(object):
 
     self.saver = tf.train.Saver( tf.global_variables(), max_to_keep=10 )
 
-  def step(self, session, encoder_inputs, decoder_inputs, decoder_outputs,
-           forward_only, srnn_seeds=False ):
+  def step(self, session, encoder_inputs, decoder_inputs, decoder_outputs, seq_length,
+           forward_only, sample=False ):
     """Run a step of the model feeding the given inputs.
 
     Args
@@ -174,7 +190,7 @@ class Seq2SeqModel(object):
       decoder_inputs: list of numpy vectors to feed as decoder inputs.
       decoder_outputs: list of numpy vectors that are the expected decoder outputs.
       forward_only: whether to do the backward step or only forward.
-      srnn_seeds: True if you want to evaluate using the sequences of SRNN
+      sample: True if you want to evaluate using the sequences of SRNN
     Returns
       A triple consisting of gradient norm (or None if we did not do backward),
       mean squared error, and the outputs.
@@ -184,10 +200,11 @@ class Seq2SeqModel(object):
     """
     input_feed = {self.encoder_inputs: encoder_inputs,
                   self.decoder_inputs: decoder_inputs,
-                  self.decoder_outputs: decoder_outputs}
+                  self.decoder_outputs: decoder_outputs,
+                  self.seq_length: seq_length}
 
     # Output feed: depends on whether we do a backward step or not.
-    if not srnn_seeds:
+    if not sample:
       if not forward_only:
 
         # Training step
@@ -203,14 +220,13 @@ class Seq2SeqModel(object):
       else:
         # Validation step, not on SRNN's seeds
         output_feed = [self.loss, # Loss for this batch.
-                       self.outputs,
                        self.loss_summary]
 
         outputs = session.run(output_feed, input_feed)
-        return outputs[0], outputs[1], outputs[2]  # No gradient norm
+        return outputs[0], outputs[1]# No gradient norm
     else:
       # Validation on SRNN's seeds
-      output_feed = [self.loss, # Loss for this batch.
+      output_feed = [self.loss_each_data, # Loss for this batch.
                      self.outputs,
                      self.loss_summary]
 

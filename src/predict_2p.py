@@ -124,7 +124,7 @@ def train():
 
   number_of_actions = len( actions )
 
-  train_set, test_set, rp_stats, ch_stats = read_all_data(
+  train_set, test_set, train_seq_len, test_seq_len, rp_stats, ch_stats = read_all_data(
     actions, FLAGS.seq_length_in, FLAGS.data_dir, not FLAGS.omit_one_hot )
 
   # Limit TF to take a fraction of the GPU memory
@@ -157,8 +157,9 @@ def train():
       encoder_inputs = train_set[batch_shuffle, 0, :FLAGS.seq_length_in]
       decoder_inputs = train_set[batch_shuffle, 0, FLAGS.seq_length_in:]
       decoder_outputs= train_set[batch_shuffle, 1, FLAGS.seq_length_in:]
-
-      _, step_loss, loss_summary, lr_summary = model.step( sess, encoder_inputs, decoder_inputs, decoder_outputs, False )
+      seq_length = train_seq_len[batch_shuffle]
+      
+      _, step_loss, loss_summary, lr_summary = model.step( sess, encoder_inputs, decoder_inputs, decoder_outputs, seq_length,  False )
       
       model.train_writer.add_summary(summary=loss_summary,global_step=current_step)
       #model.train_writer.add_summary( summary=lr_summary, global_step=current_step )
@@ -183,9 +184,11 @@ def train():
         encoder_inputs = test_set[:, 0, :FLAGS.seq_length_in]
         decoder_inputs = test_set[:, 0, FLAGS.seq_length_in:]
         decoder_outputs= test_set[:, 1, FLAGS.seq_length_in:]
+        seq_length = test_seq_len
         
         step_loss, loss_summary = model.step(sess,
-            encoder_inputs, decoder_inputs, decoder_outputs, forward_only)
+                                             encoder_inputs, decoder_inputs,
+                                             decoder_outputs, seq_length,forward_only)
         val_loss = step_loss # Loss book-keeping
 
         model.test_writer.add_summary(summary=loss_summary,global_step=current_step)
@@ -237,7 +240,7 @@ def sample():
     print("Model created")
 
     # Load all the data
-    train_set, test_set, rp_stats, ch_stats = read_all_data(
+    train_set, test_set, train_seq_len, test_seq_len, rp_stats, ch_stats = read_all_data(
       actions, FLAGS.seq_length_in, FLAGS.data_dir, not FLAGS.omit_one_hot )
     
     # Clean and create a new h5 file of samples
@@ -247,16 +250,18 @@ def sample():
     except OSError:
       pass
 
-    # Predict and save for each action
+ # Predict and save for each action
     for action in actions:
 
 
       encoder_inputs = test_set[:, 0, :FLAGS.seq_length_in]
       decoder_inputs = test_set[:, 0, FLAGS.seq_length_in:]
       decoder_outputs= test_set[:, 1, FLAGS.seq_length_in:]
+      seq_length = test_seq_len
       
       forward_only = True
-      pred_loss, pred_poses, _ = model.step(sess, encoder_inputs, decoder_inputs, decoder_outputs, forward_only, False)
+      sample =True
+      pred_loss, pred_poses, _ = model.step(sess, encoder_inputs, decoder_inputs, decoder_outputs, seq_length, forward_only, sample)
 
       pred_poses = np.array(pred_poses)
 
@@ -270,7 +275,7 @@ def sample():
                                                          ch_stats, actions, False)
 
       # Save the conditioning seeds
-
+      print("loss: {}".format(np.mean(pred_loss)))
       # Save the samples
       os.mkdir(SAMPLES_DNAME)
       for i in range(len(pred_poses)):
@@ -278,7 +283,7 @@ def sample():
                  real_person=test_set[i,0],
                  character=pred_poses[i],
                  ground_truth=test_set[i,1],
-                 loss=pred_loss)
+                 loss=pred_loss[i])
       '''' 
       # Compute and save the errors here
       mean_errors = np.zeros( (len(srnn_pred_expmap), srnn_pred_expmap[0].shape[0]) )
@@ -401,7 +406,7 @@ def read_all_data( actions, seq_length_in, data_dir, one_hot ):
   
   print("done reading data.")
 
-  return train_seq, test_seq, rp_stats, ch_stats
+  return train_seq, test_seq, train_seq_len, test_seq_len, rp_stats, ch_stats
 
 
 def main(_):
