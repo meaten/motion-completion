@@ -24,6 +24,7 @@ class Seq2SeqModel(object):
                source_seq_len,
                #target_seq_len,
                seq_max_length,
+               human_size,
                rnn_size, # hidden recurrent layer size
                num_layers,
                max_gradient_norm,
@@ -60,7 +61,7 @@ class Seq2SeqModel(object):
       dtype: the data type to use to store internal variables.
     """
 
-    self.HUMAN_SIZE = 63
+    self.HUMAN_SIZE = human_size
     self.input_size = self.HUMAN_SIZE + number_of_actions if one_hot else self.HUMAN_SIZE
 
     print( "One hot is ", one_hot )
@@ -127,11 +128,17 @@ class Seq2SeqModel(object):
         return prev
     elif loss_to_use == "supervised":
       pass
+
     else:
       raise(ValueError, "unknown loss: %s" % loss_to_use)
 
     # Build the RNN
     if architecture == "basic":
+      def loop_fn(time, cell_output, cell_state, loop_state):
+        emit_output = cell_output
+        if cell_output is None:
+          next_cell_state = cell.zero_state(self.batch_size, tf.float32)
+      
       # Basic RNN does not have a loop function in its API, so copying here.
       with vs.variable_scope("basic_rnn_seq2seq"):
         _, enc_state = tf.contrib.rnn.static_rnn(cell, enc_in, dtype=tf.float32) # Encoder
@@ -145,17 +152,17 @@ class Seq2SeqModel(object):
     mask1 = tf.tile(tf.expand_dims(tf.transpose(tf.sequence_mask(
       self.seq_length-self.source_seq_len,
       dtype=tf.float32,
-      maxlen=self.target_seq_len)),-1), [1,1,63])
+      maxlen=self.target_seq_len)),-1), [1,1,self.input_size])
     mask2 = tf.tile(tf.expand_dims(tf.transpose(tf.sequence_mask(
       self.seq_length-self.source_seq_len-1,
       dtype=tf.float32,
-      maxlen=self.target_seq_len-1)),-1), [1,1,63])
+      maxlen=self.target_seq_len-1)),-1), [1,1,self.input_size])
     with tf.name_scope("loss_angles"):
       loss_angles = tf.reduce_mean(tf.square(tf.subtract(tf.multiply(outputs,mask1),
                                                          tf.multiply(dec_out,mask1))))
     loss_smooth = tf.reduce_mean(tf.square(
       tf.multiply(tf.subtract(outputs[1:],outputs[:-1]),mask2)))
-    self.loss         = tf.add(loss_angles, loss_smooth)
+    self.loss         = tf.add(loss_angles, loss_smooth*0.01)
     self.loss_summary = tf.summary.scalar('loss/loss', self.loss)
 
     self.loss_each_data = tf.reduce_mean(tf.square(tf.subtract(tf.multiply(dec_out,mask1),

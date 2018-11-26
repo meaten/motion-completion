@@ -8,6 +8,7 @@ from __future__ import print_function
 import numpy as np
 from six.moves import xrange # pylint: disable=redefined-builtin
 import copy
+from sklearn.decomposition import PCA
 
 def rotmat2euler( R ):
   """
@@ -142,6 +143,15 @@ def unNormalizeData(normalizedData, stats, actions, one_hot ):
   data_mean = stats[0]
   data_std = stats[1]
   dimensions_to_use = stats[3]
+  pca = stats[4]
+
+  if pca is not None:
+    shape = normalizedData.shape
+    normalizedData = np.reshape( normalizedData, [-1, pca.get_params()['n_components']])
+    normalizedData = pca.inverse_transform(normalizedData)
+    normalizedData = np.reshape(normalizedData, [shape[0], shape[1], -1])
+  else:
+    pass
   
   D = data_mean.shape[0]
   origData = np.zeros((normalizedData.shape[0],
@@ -213,55 +223,6 @@ def readCSVasFloat(filename):
   return returnArray
 
 
-def load_data(path_to_dataset, subjects, actions, one_hot):
-  """
-  Borrowed from SRNN code. This is how the SRNN code reads the provided .txt files
-  https://github.com/asheshjain399/RNNexp/blob/srnn/structural_rnn/CRFProblems/H3.6m/processdata.py#L270
-
-  Args
-    path_to_dataset: string. directory where the data resides
-    subjects: list of numbers. The subjects to load
-    actions: list of string. The actions to load
-    one_hot: Whether to add a one-hot encoding to the data
-  Returns
-    trainData: dictionary with k:v
-      k=(subject, action, subaction, 'even'), v=(nxd) un-normalized data
-    completeData: nxd matrix with all the data. Used to normlization stats
-  """
-  nactions = len( actions )
-
-  trainData = {}
-  completeData = []
-
-  for action_idx in np.arange(len(actions)):
-
-    action = actions[ action_idx ]
-
-    filename = '{0}/{1}.npz'.format( path_to_dataset, action)
-    action_sequence = np.load(filename)['seq']
-    action_sequence_len = np.load(filename)['seq_len']
-
-    #############################################################
-    n, d = action_sequence.shape
-    even_list = range(0, n, 2)
-
-    if one_hot:
-      # Add a one-hot encoding at the end of the representation
-      the_sequence = np.zeros( (len(even_list), d + nactions), dtype=float )
-      the_sequence[ :, 0:d ] = action_sequence[even_list, :]
-      the_sequence[ :, d+action_idx ] = 1
-      trainData[(subj, action, subact, 'even')] = the_sequence
-    else:
-      trainData[(subj, action, subact, 'even')] = action_sequence[even_list, :]
-
-
-    if len(completeData) == 0:
-      completeData = copy.deepcopy(action_sequence)
-    else:
-      completeData = np.append(completeData, action_sequence, axis=0)
-
-  return trainData, completeData
-
 def rotmat(x,y):
   norm_x = np.linalg.norm(x)
   norm_y = np.linalg.norm(y)
@@ -295,7 +256,7 @@ def rotate_data(all_seq):
   for i, seq in enumerate(all_seq):
     origin = seq[0,0,0]
     seq[:,:,0] -= origin
-    R = rotmat(seq[1,0,0] - seq[0,0,0], [1,0,0])
+    R = rotmat([1,0,0],seq[1,0,0] - seq[0,0,0])
     seq = np.matmul(seq, R)
     R = rotmat([0,0,1], seq[0,0,1])
     seq = np.matmul(seq, R)
@@ -322,11 +283,19 @@ def normalize_data( data, stats, actions, one_hot ):
   data_mean = stats[0]
   data_std = stats[1]
   dim_to_use = stats[3]
+  pca = stats[4]
   
   if not one_hot:
     # No one-hot encoding... no need to do anything special
     data_out = np.divide( (data - data_mean), data_std )
     data_out = data_out[ :, :,dim_to_use ]
+    if pca is not None:
+      shape = data_out.shape
+      data_out = np.reshape(data_out, [-1,shape[2]])
+      data_out = pca.transform(data_out)
+      data_out = np.reshape(data_out, [shape[0], shape[1], pca.get_params()['n_components']])
+    else:
+      pass
 
   else:
     print('this has not been implemented')
@@ -334,7 +303,7 @@ def normalize_data( data, stats, actions, one_hot ):
   return data_out
 
 
-def normalization_stats(completeData):
+def normalization_stats(completeData, dim_to_compressed):
   """"
   Also borrowed for SRNN code. Computes mean, stdev and dimensions to ignore.
   https://github.com/asheshjain399/RNNexp/blob/srnn/structural_rnn/CRFProblems/H3.6m/processdata.py#L33
@@ -356,5 +325,23 @@ def normalization_stats(completeData):
   dimensions_to_ignore.extend( list(np.where(data_std < 1e-4)[0]) )
   dimensions_to_use.extend( list(np.where(data_std >= 1e-4)[0]) )
 
-  data_std[dimensions_to_ignore] = 1.0
-  return data_mean, data_std, dimensions_to_ignore, dimensions_to_use
+
+  if dim_to_compressed is not None:
+    data_std[dimensions_to_ignore] = 1.0
+
+    pca = PCA(n_components=dim_to_compressed)
+    pca.fit(completeData)
+  else:
+    pca = None
+
+  '''
+  #to determine n_components
+
+  ev_ratio = pca.explained_variance_ratio_
+  ev_ratio = np.hstack([0,ev_ratio.cumsum()])
+  import matplotlib.pyplot as plt
+  plt.plot(ev_ratio)
+  plt.show()
+  '''
+  
+  return data_mean, data_std, dimensions_to_ignore, dimensions_to_use, pca

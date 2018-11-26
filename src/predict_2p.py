@@ -1,4 +1,5 @@
 
+
 """Simple code for training an RNN for motion prediction."""
 
 from __future__ import absolute_import
@@ -30,9 +31,11 @@ tf.app.flags.DEFINE_integer("iterations", int(1e5), "Iterations to train for.")
 tf.app.flags.DEFINE_string("architecture", "tied", "Seq2seq architecture to use: [basic, tied].")
 tf.app.flags.DEFINE_integer("size", 1024, "Size of each model layer.")
 tf.app.flags.DEFINE_integer("num_layers", 1, "Number of layers in the model.")
-tf.app.flags.DEFINE_integer("seq_length_in", 10, "Number of frames to feed into the encoder. 30 fps")
+tf.app.flags.DEFINE_integer("seq_length_in", 20, "Number of frames to feed into the encoder. 30 fps")
 #tf.app.flags.DEFINE_integer("seq_length_out", 10, "Number of frames that the decoder has to predict. 30 fps")
-tf.app.flags.DEFINE_integer("seq_max_length", 200, "")
+tf.app.flags.DEFINE_integer("seq_max_length", 180, "")
+tf.app.flags.DEFINE_integer("dim_to_compressed", None, "")
+
 tf.app.flags.DEFINE_boolean("omit_one_hot", True, "Whether to remove one-hot encoding from the data")
 tf.app.flags.DEFINE_boolean("residual_velocities", False, "Add a residual connection that effectively models velocities")
 # Directories
@@ -60,6 +63,7 @@ train_dir = os.path.normpath(os.path.join( FLAGS.train_dir, FLAGS.action,
   'iterations_{0}'.format(FLAGS.iterations),
   FLAGS.architecture,
   FLAGS.loss_to_use,
+  str(FLAGS.dim_to_compressed)+'dim' if FLAGS.dim_to_compressed is not None else 'without_compression',
   'omit_one_hot' if FLAGS.omit_one_hot else 'one_hot',
   'depth_{0}'.format(FLAGS.num_layers),
   'size_{0}'.format(FLAGS.size),
@@ -67,6 +71,14 @@ train_dir = os.path.normpath(os.path.join( FLAGS.train_dir, FLAGS.action,
   'residual_vel' if FLAGS.residual_velocities else 'not_residual_vel'))
 
 summaries_dir = os.path.normpath(os.path.join( train_dir, "log" )) # Directory for TB summaries
+
+'''
+if os.path.exists(train_dir):
+    import shutil
+    shutil.rmtree(train_dir)
+'''
+
+  
 
 def create_model(session, actions):
   """Create translation model and initialize or load parameters in session."""
@@ -76,6 +88,7 @@ def create_model(session, actions):
     FLAGS.seq_length_in,
     #FLAGS.seq_length_out if not sampling else 100,
     FLAGS.seq_max_length,
+    FLAGS.dim_to_compressed if FLAGS.dim_to_compressed is not None else 63,
     FLAGS.size, # hidden layer size
     FLAGS.num_layers,
     FLAGS.max_gradient_norm,
@@ -118,6 +131,7 @@ def create_model(session, actions):
 
 
 def train():
+  
   """Train a seq2seq model on human motion"""
 
   actions = define_actions( FLAGS.action )
@@ -265,24 +279,28 @@ def sample():
 
       pred_poses = np.array(pred_poses)
 
-      
+      shape = test_set.shape
+
+      unNormalized_test_set = np.zeros([shape[0], shape[1], shape[2], 63])
+      unNormalized_pred_poses = np.zeros([shape[0], shape[2], 63])
       # denormalizes too
-      test_set[:,0] = data_utils.unNormalizeData(test_set[:,0], rp_stats, actions, False)
-      test_set[:,1] = data_utils.unNormalizeData(test_set[:,1], ch_stats, actions, False)
-      pred_poses = data_utils.unNormalizeData(np.reshape(pred_poses, [pred_poses.shape[1],
+      #unNormalized_test_set[:,0] = data_utils.unNormalizeData(test_set[:,0], rp_stats, actions, False)
+      #unNormalized_test_set[:,1] = data_utils.unNormalizeData(test_set[:,1], ch_stats, actions, False)
+      unNormalized_pred_poses = data_utils.unNormalizeData(np.reshape(pred_poses, [pred_poses.shape[1],
                                                                       pred_poses.shape[0],
                                                                       -1]),
                                                          ch_stats, actions, False)
-
+      unNormalized_test_set = read_all_data(
+        actions, FLAGS.seq_length_in, FLAGS.data_dir, not FLAGS.omit_one_hot ,GT=True)
       # Save the conditioning seeds
       print("loss: {}".format(np.mean(pred_loss)))
       # Save the samples
       os.mkdir(SAMPLES_DNAME)
-      for i in range(len(pred_poses)):
+      for i in range(len(unNormalized_pred_poses)):
         np.savez(SAMPLES_DNAME+'/sample{}.npz'.format(i),
-                 real_person=test_set[i,0],
-                 character=pred_poses[i],
-                 ground_truth=test_set[i,1],
+                 real_person=unNormalized_test_set[i,0],
+                 character=unNormalized_pred_poses[i],
+                 ground_truth=unNormalized_test_set[i,1],
                  loss=pred_loss[i])
       '''' 
       # Compute and save the errors here
@@ -344,7 +362,7 @@ def define_actions( action ):
   raise( ValueError, "Unrecognized action: %d" % action )
 
 
-def read_all_data( actions, seq_length_in, data_dir, one_hot ):
+def read_all_data( actions, seq_length_in, data_dir, one_hot ,GT=False):
   """
   Loads data for training/testing and normalizes it.
 
@@ -367,16 +385,15 @@ def read_all_data( actions, seq_length_in, data_dir, one_hot ):
     all_seq = np.concatenate((all_seq, action_seq), axis=0) if i > 0 else action_seq
     all_seq_len = np.concatenate((all_seq_len, action_seq_len), axis=0) \
                   if i > 0 else action_seq_len
+  for i in range(len(all_seq)):
+    if all_seq[i,0,0,0,0] > all_seq[i,0,0,0,1]:
+      all_seq[i,:,:,:,1] = -all_seq[i,:,:,:,1]
 
   """
   all_seq: [data_index, skeleton_num, frame_len, joints, xyz]
   """
-  all_seq = np.concatenate((data_utils.rotate_data(all_seq),
-                            data_utils.rotate_data(all_seq[:,[1,0]])), axis=0)
-
-  #all_seq = np.concatenate((all_seq,all_seq[:,[1,0]]), axis=0)
+  all_seq = data_utils.rotate_data(all_seq)
   
-  all_seq_len = np.asarray(np.concatenate((all_seq_len, all_seq_len), axis=0), dtype=int)
   shape = all_seq.shape
   all_seq = np.reshape(all_seq, [shape[0], shape[1], shape[2], -1])
   
@@ -384,29 +401,50 @@ def read_all_data( actions, seq_length_in, data_dir, one_hot ):
   train_seq, test_seq, train_seq_len, test_seq_len = train_test_split(all_seq,
                                                                       all_seq_len,
                                                                       test_size=0.25,
-                                                                      random_state=0)
-  
+                                                                      random_state=1)
+  if GT:
+    return test_seq
   for i, (seq, seq_len) in enumerate(zip(train_seq, train_seq_len)):
     try:
-      complete_seq = np.concatenate((complete_seq, seq[: ,:seq_len]), axis=1) if i > 0 \
-                     else seq[:, :seq_len]
-    except ValueError:
+      complete_seq = np.concatenate((complete_seq, seq[: ,:int(seq_len)]), axis=1) if i > 0 \
+                     else seq[:, :int(seq_len)]
+    except TypeError:
       import pdb; pdb.set_trace()
+
   complete_real_person, complete_character = complete_seq
-  
+
+  '''
+  #for data_visualization
+  np.savez('all_data_mirror.npz',
+           real_person=complete_real_person,
+           character=complete_character,
+           ground_truth=complete_character,
+           loss=0)
+  sys.exit()
+  '''
   # Compute normalization stats
-  rp_stats = data_utils.normalization_stats(complete_real_person)
-  ch_stats = data_utils.normalization_stats(complete_character)
+  rp_stats = data_utils.normalization_stats(complete_real_person, FLAGS.dim_to_compressed)
+  ch_stats = data_utils.normalization_stats(complete_character, FLAGS.dim_to_compressed)
 
   # Normalize -- subtract mean, divide by stdev
-  train_seq[:,0] = data_utils.normalize_data( train_seq[:,0], rp_stats, actions,one_hot )
-  train_seq[:,1] = data_utils.normalize_data( train_seq[:,1], ch_stats, actions,one_hot )
-  test_seq[:, 0] = data_utils.normalize_data( test_seq[:, 0], rp_stats, actions,one_hot )
-  test_seq[:, 1] = data_utils.normalize_data( test_seq[:, 1], ch_stats, actions,one_hot )
+  train_shape = train_seq.shape
+  test_shape = test_seq.shape
+  if rp_stats[4] is not None:
+    normalized_train_seq = np.zeros([train_shape[0], train_shape[1], train_shape[2],
+                                     rp_stats[4].get_params()['n_components']])
+    normalized_test_seq = np.zeros([test_shape[0], test_shape[1], test_shape[2],
+                                    rp_stats[4].get_params()['n_components']])
+  else:
+    normalized_train_seq = np.zeros(train_shape)
+    normalized_test_seq  = np.zeros(test_shape)
+  normalized_train_seq[:,0] = data_utils.normalize_data( train_seq[:,0], rp_stats, actions,one_hot )
+  normalized_train_seq[:,1] = data_utils.normalize_data( train_seq[:,1], ch_stats, actions,one_hot )
+  normalized_test_seq[:, 0] = data_utils.normalize_data( test_seq[:, 0], rp_stats, actions,one_hot )
+  normalized_test_seq[:, 1] = data_utils.normalize_data( test_seq[:, 1], ch_stats, actions,one_hot )
   
   print("done reading data.")
 
-  return train_seq, test_seq, train_seq_len, test_seq_len, rp_stats, ch_stats
+  return normalized_train_seq, normalized_test_seq, train_seq_len, test_seq_len, rp_stats, ch_stats
 
 
 def main(_):

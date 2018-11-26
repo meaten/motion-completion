@@ -54,7 +54,7 @@ class ResidualWrapper(RNNCell):
     output, new_state = self._cell(inputs, state, scope)
 
     # Add the residual connection
-    output = tf.add(output, inputs)
+    output = tf.add(output, inputs[:,self._cell.output_size()])
 
     return output, new_state
 
