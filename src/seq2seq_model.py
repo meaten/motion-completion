@@ -71,7 +71,7 @@ class Seq2SeqModel(object):
     self.train_writer = tf.summary.FileWriter(os.path.normpath(os.path.join( summaries_dir, 'train')))
     self.test_writer  = tf.summary.FileWriter(os.path.normpath(os.path.join( summaries_dir, 'test')))
 
-    self.max_seq_len = max_seq_len
+    self.max_seq_len = int(max_seq_len)
     self.rnn_size = rnn_size
     self.batch_size = batch_size
     self.learning_rate = tf.Variable( float(learning_rate), trainable=False, dtype=dtype )
@@ -82,6 +82,7 @@ class Seq2SeqModel(object):
     print('rnn_size = {0}'.format( rnn_size ))
     cell = tf.contrib.rnn.GRUCell( self.rnn_size )
 
+    self.num_layers = num_layers
     if num_layers > 1:
       cell = tf.contrib.rnn.MultiRNNCell( [tf.contrib.rnn.GRUCell(self.rnn_size) for _ in range(num_layers)] )
 
@@ -115,88 +116,62 @@ class Seq2SeqModel(object):
     if residual_velocities:
       cell = rnn_cell_extensions.ResidualWrapper( cell )
 
+    self.gen_cell = cell
     # Store the outputs here
     outputs  = []
 
     self.stddev = stddev
-    def addGN(inputs):
-      noise = tf.random_normal(shape=tf.shape(inputs), mean=0.0, stddev=self.stddev, dtype=tf.float32)
-      return inputs + noise
-
     self.is_training = tf.placeholder(dtype=tf.bool)
+    self.outputs = self.generator(inputs)
+
+    outputs = self.outputs
+    D_real = self.discriminator(inputs[:self.max_seq_len], gts)
+    D_fake = self.discriminator(inputs[:self.max_seq_len], outputs)
+    '''
+    def gradient_penalty(inputs, real, fake):
+      epsilon = tf.random_uniform([], 0.0, 1.0)
+      x_hat = epsilon*real + (1 - epsilon) * fake
+      pred = self.discriminator(inputs, x_hat)
+      gradients = tf.gradients(pred, x_hat)[0]
+      slopes = tf.sqrt(tf.reduce_sum(tf.square(gradients), axis=1))
+      gp = tf.reduce_mean((slopes - 1.)**2)
+      return gp
+    '''
+    WD_loss = tf.reduce_mean(D_real) - tf.reduce_mean(D_fake)
+    #gp = gradient_penalty(inputs[:self.max_seq_len], gts, outputs)
+    with tf.name_scope('loss') as scope:
+      self.D_loss = WD_loss #+gp * 10.0
+      self.G_loss = -tf.reduce_mean(D_fake)
+
+      G_summary = tf.summary.scalar('G_loss', self.G_loss)
+      D_summary = tf.summary.scalar('D_loss', self.D_loss)
+      self.loss_summary = tf.summary.merge_all()
     
-    # Build the RNN
-    if architecture == "basic":
-      cell_init_state = tf.Variable(np.zeros([1,cell.state_size]),trainable=True, dtype=tf.float32)
-      init_input = tf.Variable(np.zeros([63]), trainable=True, dtype=tf.float32)
-      output_ta = tf.TensorArray(size=self.max_seq_len, dtype=tf.float32)
-      def loop_fn(time, cell_output, cell_state, loop_state):
-        emit_output = cell_output
-        if cell_output is None:
-          #next_cell_state = cell.zero_state(self.batch_size, tf.float32)
-          next_cell_state = tf.tile(cell_init_state, [tf.shape(inputs[0])[0],1])
-          next_input = tf.cond(self.is_training,
-                               lambda: tf.concat([tf.tile(tf.expand_dims(init_input,0),[tf.shape(inputs[0])[0],1]),
-                                                  addGN(inputs[time])], axis=1),
-                               lambda: tf.concat([tf.tile(tf.expand_dims(init_input,0),[tf.shape(inputs[0])[0],1]),
-                                                  inputs[time]], axis=1))
-          next_loop_state = output_ta
-        else:
-          next_cell_state = cell_state
-          next_input = tf.cond(self.is_training,
-                               lambda: tf.concat([cell_output, addGN(inputs[time])], axis=1),
-                               lambda: tf.concat([cell_output, inputs[time]], axis=1))
 
-          next_loop_state = loop_state.write(time-1, cell_output)
-
-        finished = (time > self.max_seq_len-1)
-        #finished = False
-        return (finished, next_input, next_cell_state, emit_output, next_loop_state)
-          
-      
-      # Basic RNN does not have a loop function in its API, so copying here.
-      with vs.variable_scope("raw_rnn"):
-        _, _, loop_state_ta = tf.nn.raw_rnn(cell, loop_fn)
-        #outputs = _transpose_batch_time(loop_state_ta.stack())
-        outputs = loop_state_ta.stack()
-        
-    self.outputs = outputs
-    mask1 = tf.tile(tf.expand_dims(tf.transpose(tf.sequence_mask(
-      self.seq_len,
-      dtype=tf.float32,
-      maxlen=self.max_seq_len)),-1), [1,1,self.input_size])
-    mask2 = tf.tile(tf.expand_dims(tf.transpose(tf.sequence_mask(
-      self.seq_len-1,
-      dtype=tf.float32,
-      maxlen=self.max_seq_len-1)),-1), [1,1,self.input_size])
-    with tf.name_scope("loss_pos"):
-      loss_pos = tf.reduce_mean(tf.square(tf.subtract(tf.multiply(outputs,mask1),
-                                                         tf.multiply(gts,mask1))))
-    with tf.name_scope("loss_smooth"):
-      loss_smooth = tf.reduce_mean(tf.square(
-        tf.multiply(tf.subtract(outputs[1:],outputs[:-1]),mask2)))
-    #self.loss         = tf.add(loss_pos, loss_smooth*1000)
-    self.loss = loss_pos
-    self.loss_summary = tf.summary.scalar('loss/loss', self.loss)
-
-    self.loss_each_data = tf.reduce_mean(tf.square(tf.subtract(tf.multiply(gts,mask1),
-                                                               tf.multiply(outputs,mask1))),
-                                         axis=[0,2]) \
-                          + tf.reduce_mean(tf.square(tf.multiply(tf.subtract(
-                          outputs[1:], outputs[:-1]),mask2)),axis=[0,2])
     # Gradients and SGD update operation for training the model.
-    params = tf.trainable_variables()
-
-    opt = tf.train.AdamOptimizer(learning_rate=learning_rate)
-
+    var_D = tf.trainable_variables(scope='discriminator')
+    var_G = tf.trainable_variables(scope='generator')
+    '''
+    self.D_updates = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.5).minimize(self.D_loss,
+                                                                                             var_list=var_D)
+    self.G_updates = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.5).minimize(self.G_loss,
+                                                                                             var_list=var_G)
+    '''
+    D_opt = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.5)
+    G_opt = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.5)
+    
     # Update all the trainable parameters
-    gradients = tf.gradients( self.loss, params )
-
-    clipped_gradients, norm = tf.clip_by_global_norm(gradients, max_gradient_norm)
-    self.gradient_norms = norm
-    self.updates = opt.apply_gradients(
-      zip(clipped_gradients, params), global_step=self.global_step)
-
+    G_gradients = tf.gradients( self.G_loss, var_G )
+    D_gradients = tf.gradients( -self.D_loss, var_D )
+    
+    G_clipped_gradients, G_norm = tf.clip_by_global_norm(G_gradients, max_gradient_norm)
+    D_clipped_gradients, D_norm = tf.clip_by_global_norm(D_gradients, max_gradient_norm)
+    self.gradient_norms = G_norm + D_norm
+    self.D_updates = D_opt.apply_gradients(
+      zip(D_clipped_gradients, var_D), global_step=self.global_step)
+    self.G_updates = G_opt.apply_gradients(
+      zip(G_clipped_gradients, var_G), global_step=self.global_step)
+    
     self.learning_rate_summary = tf.summary.scalar('learning_rate/learning_rate', self.learning_rate)
 
     self.saver = tf.train.Saver( tf.global_variables(), max_to_keep=10 )
@@ -229,14 +204,20 @@ class Seq2SeqModel(object):
                       self.seq_len: seq_len,
                       self.is_training: True}
         # Training step
-        output_feed = [self.updates,         # Update Op that does SGD.
+        mean_D_loss = 0
+        n_critic = 1
+        for i in range(n_critic):
+          D_loss , _ = session.run([self.D_loss, self.D_updates], input_feed)
+          mean_D_loss += D_loss/n_critic
+          
+        output_feed = [self.G_updates,         # Update Op that does SGD.
                        self.gradient_norms,  # Gradient norm.
-                       self.loss,
+                       self.G_loss,
                        self.loss_summary,
                        self.learning_rate_summary]
 
         outputs = session.run( output_feed, input_feed )
-        return outputs[1], outputs[2], outputs[3], outputs[4]  # Gradient norm, loss, summaries
+        return outputs[1], mean_D_loss, outputs[2], outputs[3], outputs[4]  # Gradient norm, loss, summaries
 
       else:
         input_feed = {self.inputs: inputs,
@@ -244,22 +225,94 @@ class Seq2SeqModel(object):
                       self.seq_len: seq_len,
                       self.is_training: False}
         # Validation step, not on SRNN's seeds
-        output_feed = [self.loss, # Loss for this batch.
+        output_feed = [self.D_loss, # Loss for this batch.
+                       self.G_loss,
                        self.loss_summary]
 
         outputs = session.run(output_feed, input_feed)
-        return outputs[0], outputs[1]# No gradient norm
+        return outputs[0], outputs[1], outputs[2]# No gradient norm
     else:
       # Validation on SRNN's seeds
       input_feed = {self.inputs: inputs,
                     self.gts: gts,
                     self.seq_len: seq_len,
                     self.is_training: True}
-      output_feed = [self.loss_each_data, # Loss for this batch.
-                     self.outputs,
+      output_feed = [self.outputs,
                      self.loss_summary]
 
       outputs = session.run(output_feed, input_feed)
 
-      return outputs[0], outputs[1], outputs[2]  # No gradient norm, loss, outputs.
+      return outputs[0], outputs[1]  # No gradient norm, loss, outputs.
 
+  def generator(self, inputs):
+    with tf.name_scope("generator") as scope:
+    
+      def addGN(inputs):
+        noise = tf.random_normal(shape=tf.shape(inputs), mean=0.0, stddev=self.stddev, dtype=tf.float32)
+        return inputs + noise
+
+      # Build the RNN
+      cell_init_state = tf.Variable(np.zeros([1,self.gen_cell.state_size]),trainable=True, dtype=tf.float32)
+      init_input = tf.Variable(np.zeros([63]), trainable=True, dtype=tf.float32)
+      output_ta = tf.TensorArray(size=self.max_seq_len, dtype=tf.float32)
+      def loop_fn(time, cell_output, cell_state, loop_state):
+        emit_output = cell_output
+        if cell_output is None:
+          #next_cell_state = cell.zero_state(self.batch_size, tf.float32)
+          next_cell_state = tf.tile(cell_init_state, [tf.shape(inputs[0])[0],1])
+          next_input = tf.cond(self.is_training,
+                               lambda: tf.concat([tf.tile(tf.expand_dims(init_input,0),[tf.shape(inputs[0])[0],1]),
+                                                  addGN(inputs[time])], axis=1),
+                               lambda: tf.concat([tf.tile(tf.expand_dims(init_input,0),[tf.shape(inputs[0])[0],1]),
+                                                  inputs[time]], axis=1))
+          next_loop_state = output_ta
+        else:
+          next_cell_state = cell_state
+          next_input = tf.cond(self.is_training,
+                               lambda: tf.concat([cell_output, addGN(inputs[time])], axis=1),
+                               lambda: tf.concat([cell_output, inputs[time]], axis=1))
+
+          next_loop_state = loop_state.write(time-1, cell_output)
+
+        finished = (time > self.max_seq_len-1)
+        #finished = False
+        return (finished, next_input, next_cell_state, emit_output, next_loop_state)
+
+
+        # Basic RNN does not have a loop function in its API, so copying here.
+      with vs.variable_scope("raw_rnn"):
+        _, _, loop_state_ta = tf.nn.raw_rnn(self.gen_cell, loop_fn)
+        #outputs = _transpose_batch_time(loop_state_ta.stack())
+        outputs = loop_state_ta.stack()
+
+    return outputs
+      
+  def discriminator(self, inputs, query, reuse=True):
+    with tf.variable_scope("discriminator", reuse=tf.AUTO_REUSE) as scope:
+      inputs = tf.concat([inputs, query], axis=2)
+      cell = tf.contrib.rnn.BasicLSTMCell( self.rnn_size)
+      #one_initial_state = tf.Variable(np.zeros([1, self.gen_cell.state_size]), trainable=True, dtype=tf.float32)
+      #initial_state = tf.tile(one_initial_state, [tf.shape(query[0])[0], 1])
+      #initial_state = tf.Variable(cell.zero_state(1, dtype=tf.float32))
+
+      self.dis_cell = tf.contrib.rnn.MultiRNNCell([cell] * self.num_layers)
+      output, _ = tf.nn.dynamic_rnn(self.dis_cell, inputs, sequence_length=self.seq_len,
+                                    initial_state=None,dtype=tf.float32, time_major=True)
+      output = tf.transpose(output, [1,0,2])
+
+      last = tf.gather(output, tf.shape(output)[0] -1)
+
+      w0, b0 = self._weight_and_bias(1024, 256)
+      w1, b1 = self._weight_and_bias(256, 32)
+      w2, b2 = self._weight_and_bias(32, 1)
+
+      h0 = tf.nn.relu(tf.matmul(last, w0) + b0)
+      h1 = tf.nn.relu(tf.matmul(h0, w1) + b1)
+      h2 = tf.nn.relu(tf.matmul(h1, w2) + b2)
+
+      return h2
+
+  def _weight_and_bias(self, in_size, out_size):
+    weight = tf.truncated_normal([in_size, out_size], stddev=0.01)
+    bias = tf.constant(0.1, shape=[out_size])
+    return tf.Variable(weight), tf.Variable(bias)

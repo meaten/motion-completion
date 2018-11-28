@@ -156,7 +156,7 @@ def train():
     current_step = 0 if FLAGS.load <= 0 else FLAGS.load + 1
     previous_losses = []
 
-    step_time, loss = 0, 0
+    step_time, D_loss, G_loss = 0, 0, 0
 
     for _ in xrange( FLAGS.iterations ):
 
@@ -170,16 +170,17 @@ def train():
       gts= train_set[batch_shuffle, 1]
       seq_length = train_seq_len[batch_shuffle]
       
-      _, step_loss, loss_summary, lr_summary = model.step( sess, inputs, gts, seq_length,  False )
+      _, step_D_loss, step_G_loss, loss_summary, lr_summary = model.step( sess, inputs, gts, seq_length,  False )
       
       model.train_writer.add_summary(summary=loss_summary,global_step=current_step)
       #model.train_writer.add_summary( summary=lr_summary, global_step=current_step )
       
       if current_step % 10 == 0:
-        print("step {0:04d}; step_loss: {1:.4f}".format(current_step, step_loss ))
+        print("step {0:04d}; D_loss: {1:.4f}; G_loss: {1:.4f}".format(current_step, step_D_loss , step_G_loss))
 
       step_time += (time.time() - start_time) / FLAGS.test_every
-      loss += step_loss / FLAGS.test_every
+      G_loss += step_G_loss / FLAGS.test_every
+      D_loss += step_D_loss / FLAGS.test_every
       current_step += 1
 
       # === step decay ===
@@ -197,8 +198,7 @@ def train():
         gts = test_set[:, 1]
         seq_length = test_seq_len
         
-        step_loss, loss_summary = model.step(sess, inputs, gts, seq_length,forward_only)
-        val_loss = step_loss # Loss book-keeping
+        step_D_loss, step_G_loss, loss_summary = model.step(sess, inputs, gts, seq_length,forward_only)
 
         model.test_writer.add_summary(summary=loss_summary,global_step=current_step)
 
@@ -208,11 +208,15 @@ def train():
               "Global step:         %d\n"
               "Learning rate:       %.4f\n"
               "Step-time (ms):     %.4f\n"
-              "Train loss avg:      %.4f\n"
+              "Train D_loss avg:      %.4f\n"
+              "Train G_loss avg:      %.4f\n"
               "--------------------------\n"
-              "Val loss:            %.4f\n"
+              "Val D_loss:            %.4f\n"
+              "Val G_loss:            %.4f\n"
               "============================" % (model.global_step.eval(),
-              model.learning_rate.eval(), step_time*1000, loss,val_loss))
+                                                model.learning_rate.eval(), step_time*1000,
+                                                D_loss, G_loss,
+                                                step_D_loss, step_G_loss))
         print()
 
         previous_losses.append(loss)
@@ -271,10 +275,10 @@ def sample():
       
       forward_only = True
       sample =True
-      pred_loss, pred_poses, _ = model.step(sess, inputs, gts, seq_length, forward_only, sample)
+      pred_poses, _ = model.step(sess, inputs, gts, seq_length, forward_only, sample)
 
       pred_poses = np.array(pred_poses)
-
+      pred_loss = np.zeros([pred_poses.shape[0]])
       shape = test_set.shape
 
       unNormalized_test_set = np.zeros([shape[0], shape[1], shape[2], 63])
