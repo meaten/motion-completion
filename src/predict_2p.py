@@ -28,16 +28,14 @@ tf.app.flags.DEFINE_float("max_gradient_norm", 5, "Clip gradients to this norm."
 tf.app.flags.DEFINE_integer("batch_size", 16, "Batch size to use during training.")
 tf.app.flags.DEFINE_integer("iterations", int(1e5), "Iterations to train for.")
 # Architecture
-tf.app.flags.DEFINE_string("architecture", "tied", "Seq2seq architecture to use: [basic, tied].")
+tf.app.flags.DEFINE_string("architecture", "basic", "Seq2seq architecture to use: [basic, tied].")
 tf.app.flags.DEFINE_integer("size", 1024, "Size of each model layer.")
 tf.app.flags.DEFINE_integer("num_layers", 1, "Number of layers in the model.")
-tf.app.flags.DEFINE_integer("seq_length_in", 20, "Number of frames to feed into the encoder. 30 fps")
-#tf.app.flags.DEFINE_integer("seq_length_out", 10, "Number of frames that the decoder has to predict. 30 fps")
-tf.app.flags.DEFINE_integer("seq_max_length", 180, "")
+tf.app.flags.DEFINE_integer("stddev", 0.1, "stddev used to define gaussian noise added to inputs")
 tf.app.flags.DEFINE_integer("dim_to_compressed", None, "")
 
 tf.app.flags.DEFINE_boolean("omit_one_hot", True, "Whether to remove one-hot encoding from the data")
-tf.app.flags.DEFINE_boolean("residual_velocities", False, "Add a residual connection that effectively models velocities")
+tf.app.flags.DEFINE_boolean("residual_velocities", True, "Add a residual connection that effectively models velocities")
 # Directories
 tf.app.flags.DEFINE_string("data_dir", os.path.normpath("./data/"), "Data directory")
 tf.app.flags.DEFINE_string("train_dir", os.path.normpath("./experiments/"), "Training directory.")
@@ -80,18 +78,17 @@ if os.path.exists(train_dir):
 
   
 
-def create_model(session, actions):
+def create_model(session, actions, max_seq_len):
   """Create translation model and initialize or load parameters in session."""
   
   model = seq2seq_model.Seq2SeqModel(
     FLAGS.architecture,
-    FLAGS.seq_length_in,
-    #FLAGS.seq_length_out if not sampling else 100,
-    FLAGS.seq_max_length,
+    max_seq_len,
     FLAGS.dim_to_compressed if FLAGS.dim_to_compressed is not None else 63,
     FLAGS.size, # hidden layer size
     FLAGS.num_layers,
     FLAGS.max_gradient_norm,
+    FLAGS.stddev,
     FLAGS.batch_size,
     FLAGS.learning_rate,
     FLAGS.learning_rate_decay_factor,
@@ -138,8 +135,8 @@ def train():
 
   number_of_actions = len( actions )
 
-  train_set, test_set, train_seq_len, test_seq_len, rp_stats, ch_stats = read_all_data(
-    actions, FLAGS.seq_length_in, FLAGS.data_dir, not FLAGS.omit_one_hot )
+  train_set, test_set, train_seq_len, test_seq_len, rp_stats, ch_stats , max_seq_len= read_all_data(
+    actions, FLAGS.data_dir, not FLAGS.omit_one_hot )
 
   # Limit TF to take a fraction of the GPU memory
   gpu_options = tf.GPUOptions(allow_growth=True)
@@ -150,7 +147,7 @@ def train():
     # === Create the model ===
     print("Creating %d layers of %d units." % (FLAGS.num_layers, FLAGS.size))
 
-    model = create_model( sess, actions )
+    model = create_model( sess, actions , max_seq_len)
     model.train_writer.add_graph( sess.graph )
     print( "Model created" )
 
@@ -168,12 +165,12 @@ def train():
       
       # === Training step ===
       #encoder_inputs, decoder_inputs, decoder_outputs = model.get_batch( train_set, not FLAGS.omit_one_hot )
-      encoder_inputs = train_set[batch_shuffle, 0, :FLAGS.seq_length_in]
-      decoder_inputs = train_set[batch_shuffle, 0, FLAGS.seq_length_in:]
-      decoder_outputs= train_set[batch_shuffle, 1, FLAGS.seq_length_in:]
+      inputs = train_set[batch_shuffle, 0]
+      inputs = np.pad(inputs, [[0,0],[0,1],[0,0]],'constant')
+      gts= train_set[batch_shuffle, 1]
       seq_length = train_seq_len[batch_shuffle]
       
-      _, step_loss, loss_summary, lr_summary = model.step( sess, encoder_inputs, decoder_inputs, decoder_outputs, seq_length,  False )
+      _, step_loss, loss_summary, lr_summary = model.step( sess, inputs, gts, seq_length,  False )
       
       model.train_writer.add_summary(summary=loss_summary,global_step=current_step)
       #model.train_writer.add_summary( summary=lr_summary, global_step=current_step )
@@ -195,14 +192,12 @@ def train():
         # === Validation with randomly chosen seeds ===
         forward_only = True
 
-        encoder_inputs = test_set[:, 0, :FLAGS.seq_length_in]
-        decoder_inputs = test_set[:, 0, FLAGS.seq_length_in:]
-        decoder_outputs= test_set[:, 1, FLAGS.seq_length_in:]
+        inputs = test_set[:, 0]
+        inputs = np.pad(inputs, [[0,0],[0,1],[0,0]],'constant')
+        gts = test_set[:, 1]
         seq_length = test_seq_len
         
-        step_loss, loss_summary = model.step(sess,
-                                             encoder_inputs, decoder_inputs,
-                                             decoder_outputs, seq_length,forward_only)
+        step_loss, loss_summary = model.step(sess, inputs, gts, seq_length,forward_only)
         val_loss = step_loss # Loss book-keeping
 
         model.test_writer.add_summary(summary=loss_summary,global_step=current_step)
@@ -248,14 +243,15 @@ def sample():
   device_count = {"GPU": 0} if FLAGS.use_cpu else {"GPU": 1}
   with tf.Session(config=tf.ConfigProto( device_count = device_count )) as sess:
 
+    # Load all the data
+    train_set, test_set, train_seq_len, test_seq_len, rp_stats, ch_stats , max_seq_len= read_all_data(
+      actions, FLAGS.data_dir, not FLAGS.omit_one_hot )
+
     # === Create the model ===
     print("Creating %d layers of %d units." % (FLAGS.num_layers, FLAGS.size))
-    model = create_model(sess, actions)
+    model = create_model(sess, actions, max_seq_len)
     print("Model created")
 
-    # Load all the data
-    train_set, test_set, train_seq_len, test_seq_len, rp_stats, ch_stats = read_all_data(
-      actions, FLAGS.seq_length_in, FLAGS.data_dir, not FLAGS.omit_one_hot )
     
     # Clean and create a new h5 file of samples
     SAMPLES_DNAME = 'samples'
@@ -268,14 +264,14 @@ def sample():
     for action in actions:
 
 
-      encoder_inputs = test_set[:, 0, :FLAGS.seq_length_in]
-      decoder_inputs = test_set[:, 0, FLAGS.seq_length_in:]
-      decoder_outputs= test_set[:, 1, FLAGS.seq_length_in:]
+      inputs = test_set[:, 0]
+      inputs = np.pad(inputs, [[0,0],[0,1],[0,0]],'constant')
+      gts = test_set[:, 1]
       seq_length = test_seq_len
       
       forward_only = True
       sample =True
-      pred_loss, pred_poses, _ = model.step(sess, encoder_inputs, decoder_inputs, decoder_outputs, seq_length, forward_only, sample)
+      pred_loss, pred_poses, _ = model.step(sess, inputs, gts, seq_length, forward_only, sample)
 
       pred_poses = np.array(pred_poses)
 
@@ -291,7 +287,7 @@ def sample():
                                                                       -1]),
                                                          ch_stats, actions, False)
       unNormalized_test_set = read_all_data(
-        actions, FLAGS.seq_length_in, FLAGS.data_dir, not FLAGS.omit_one_hot ,GT=True)
+        actions, FLAGS.data_dir, not FLAGS.omit_one_hot ,GT=True)
       # Save the conditioning seeds
       print("loss: {}".format(np.mean(pred_loss)))
       # Save the samples
@@ -362,7 +358,7 @@ def define_actions( action ):
   raise( ValueError, "Unrecognized action: %d" % action )
 
 
-def read_all_data( actions, seq_length_in, data_dir, one_hot ,GT=False):
+def read_all_data( actions, data_dir, one_hot ,GT=False):
   """
   Loads data for training/testing and normalizes it.
 
@@ -373,8 +369,7 @@ def read_all_data( actions, seq_length_in, data_dir, one_hot ,GT=False):
   """
 
   # === Read training data ===
-  print ("Reading training data (seq_len_in: {0}).".format(
-           seq_length_in))
+  print ("Reading training data")
 
   #####
   #need to add one-hot vector to each frame later
@@ -386,7 +381,7 @@ def read_all_data( actions, seq_length_in, data_dir, one_hot ,GT=False):
     all_seq_len = np.concatenate((all_seq_len, action_seq_len), axis=0) \
                   if i > 0 else action_seq_len
   for i in range(len(all_seq)):
-    if all_seq[i,0,0,0,0] > all_seq[i,0,0,0,1]:
+    if all_seq[i,0,0,0,0] > all_seq[i,1,0,0,0]:
       all_seq[i,:,:,:,1] = -all_seq[i,:,:,:,1]
 
   """
@@ -396,6 +391,9 @@ def read_all_data( actions, seq_length_in, data_dir, one_hot ,GT=False):
   
   shape = all_seq.shape
   all_seq = np.reshape(all_seq, [shape[0], shape[1], shape[2], -1])
+
+  np.savez('val.npz', seq=all_seq)
+
   
   from sklearn.model_selection import train_test_split
   train_seq, test_seq, train_seq_len, test_seq_len = train_test_split(all_seq,
@@ -426,6 +424,7 @@ def read_all_data( actions, seq_length_in, data_dir, one_hot ,GT=False):
   rp_stats = data_utils.normalization_stats(complete_real_person, FLAGS.dim_to_compressed)
   ch_stats = data_utils.normalization_stats(complete_character, FLAGS.dim_to_compressed)
 
+  
   # Normalize -- subtract mean, divide by stdev
   train_shape = train_seq.shape
   test_shape = test_seq.shape
@@ -444,7 +443,8 @@ def read_all_data( actions, seq_length_in, data_dir, one_hot ,GT=False):
   
   print("done reading data.")
 
-  return normalized_train_seq, normalized_test_seq, train_seq_len, test_seq_len, rp_stats, ch_stats
+  return normalized_train_seq, normalized_test_seq, train_seq_len, test_seq_len, rp_stats, ch_stats, \
+    max(all_seq_len)
 
 
 def main(_):
